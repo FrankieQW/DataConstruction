@@ -3,12 +3,12 @@
 SceneCompose is organized as three large stages:
 
 1. adaptive scene partitioning;
-2. per-region semantic/instance segmentation and cross-region fusion;
-3. region selection, object placement, constraint solving, and physical validation.
+2. whole-scene semantic/instance segmentation;
+3. object placement, constraint solving, and physical validation.
 
 ## Adaptive Scene Partitioning
 
-This repository currently implements stage 1. It targets Linux servers and runs Blender in background mode. The third-party repositories in the project root remain isolated from the orchestration package.
+This repository contains stage 1 and the orchestration code for stage 2. The two stages are independent: semantic segmentation reads complete files directly from `data/scene` and never consumes partition outputs.
 
 ### Requirements
 
@@ -118,3 +118,68 @@ Such a scene becomes the identity Region `region_full`; it references the origin
 The default intermediate format is `.blend`, which preserves materials while referencing external textures. This avoids embedding the same large textures in every Region. Set `export_format` to `glb` only when a self-contained exchange artifact is required; GLB may duplicate texture payloads across Regions.
 
 See `docs/partition-artifacts.md` for the output contract used by later pipeline stages.
+
+## Scene Semantic Segmentation
+
+Scene segmentation uses Mosaic3D for global open-vocabulary 3D features, SAM3 for promptable masks over rendered views, and Open3DIS-style geometric lifting and cross-view association. It processes every supported file below `data/scene` independently. Adaptive partitioning is not an input to this stage.
+
+### Additional environment requirements
+
+The inference environment must contain the Mosaic3D and SAM3 dependencies as well as SceneCompose. Mosaic3D currently pins PyTorch 2.2.2 in its requirements; build the CUDA environment around that constraint and install SAM3 into the same environment. SceneCompose never installs or downloads model weights.
+
+With Mamba, create a Python 3.10 inference environment:
+
+```bash
+mamba create -n scenecompose-seg -c conda-forge python=3.10 pip
+mamba activate scenecompose-seg
+python -m pip install -r Mosaic3D/requirements.txt
+python -m pip install -e sam3
+python -m pip install -e .
+```
+
+With Pixi, pin Python 3.10, install the locked SceneCompose dependencies, then install the two local model repositories:
+
+```bash
+pixi add "python=3.10.*"
+pixi install
+pixi run python -m pip install -r Mosaic3D/requirements.txt
+pixi run python -m pip install -e sam3
+pixi run python -m pip install -e .
+```
+
+Review `Mosaic3D/requirements.txt` before installation because its CUDA wheels must match the server driver. No command above downloads checkpoints.
+
+### Checkpoint configuration
+
+Edit `configs/segmentation.json` after placing weights locally:
+
+```text
+weights/mosaic3d.ckpt
+weights/sam3.pt
+```
+
+The ReCap-CLIP text encoder named by `mosaic3d.text_model_id` must already exist in the local Hugging Face cache. Inference forces offline mode and fails instead of downloading missing files.
+
+### Run
+
+First inspect discovery, paths, checkpoints, and GPU assignment without inference:
+
+```bash
+scenecompose segment-scenes \
+  --scene-root data/scene \
+  --output-root data/work \
+  --config configs/segmentation.json \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --workers 8 \
+  --dry-run
+```
+
+Run the complete pipeline with the same command after removing `--dry-run`, or use:
+
+```bash
+bash scripts/run_segmentation.sh data/scene data/work 0,1,2,3,4,5,6,7 8
+```
+
+`--resume` is enabled by default. Use `--force-stage sam3`, for example, to invalidate SAM3 and all downstream artifacts while retaining geometry, views, and Mosaic3D results. Supported stage names are `geometry`, `views`, `mosaic3d`, `sam3`, `fusion`, and `export`.
+
+Each scene writes to `data/work/<scene-id>/segmentation`. Important results are `fusion/point_labels.npz`, `fusion/face_labels.npz`, `fusion/instances.json`, `visualization/semantic.ply`, and `visualization/instances.ply`. See `docs/segmentation-artifacts.md` for schemas and coordinate conventions.

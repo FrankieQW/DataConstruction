@@ -3,10 +3,13 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+
+from scenecompose.segmentation.pipeline import STAGES, run_segmentation_batch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -171,7 +174,40 @@ def _parser() -> argparse.ArgumentParser:
     partition_all.add_argument("--workers", type=int, default=1)
     partition_all.add_argument("--force", action="store_true")
     partition_all.set_defaults(handler=_partition_all)
+
+    segment = subparsers.add_parser(
+        "segment-scenes", help="Segment complete scene files under a scene root"
+    )
+    segment.add_argument("--scene-root", type=Path, default=PROJECT_ROOT / "data" / "scene")
+    segment.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "data" / "work")
+    segment.add_argument(
+        "--config", type=Path, default=PROJECT_ROOT / "configs" / "segmentation.json"
+    )
+    segment.add_argument("--blender", default=os.environ.get("SCENECOMPOSE_BLENDER", "blender"))
+    segment.add_argument("--gpus", default=None, help="Comma-separated physical GPU ids")
+    segment.add_argument("--workers", type=int, default=None)
+    segment.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    segment.add_argument("--force-stage", choices=STAGES)
+    segment.add_argument("--dry-run", action="store_true")
+    segment.set_defaults(handler=_segment_scenes)
     return parser
+
+
+def _segment_scenes(args: argparse.Namespace) -> int:
+    gpus = None
+    if args.gpus:
+        try:
+            gpus = tuple(int(value.strip()) for value in args.gpus.split(",") if value.strip())
+        except ValueError as error:
+            raise SystemExit("--gpus must be a comma-separated list of integers") from error
+        if not gpus or any(value < 0 for value in gpus):
+            raise SystemExit("--gpus must contain non-negative GPU ids")
+    return run_segmentation_batch(
+        scene_root=args.scene_root.resolve(), output_root=args.output_root.resolve(),
+        config_path=args.config.resolve(), blender=args.blender, gpus=gpus,
+        workers=args.workers, resume=args.resume, force_stage=args.force_stage,
+        dry_run=args.dry_run,
+    )
 
 
 def main() -> int:

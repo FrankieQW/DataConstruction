@@ -5,12 +5,12 @@
 SceneCompose 整体分为三个主要阶段：
 
 1. Scene 自适应切分；
-2. 对各个 Region 进行语义/实例分割，并完成跨 Region 融合；
-3. Region 选择、Object 放置、约束求解和物理验证。
+2. 对完整 Scene 进行语义/实例分割；
+3. Object 放置、约束求解和物理验证。
 
 ## Scene 自适应切分
 
-当前仓库实现了第一阶段。代码面向 Linux 服务器，通过 Blender 后台模式运行。项目根目录中的第三方代码仓库与 SceneCompose 编排包保持隔离，不会被直接导入。
+当前仓库包含第一阶段以及第二阶段的编排代码。两个阶段相互独立：语义分割直接读取 `data/scene` 中的完整文件，不读取任何自适应切分结果。
 
 ### 环境要求
 
@@ -151,3 +151,68 @@ bash scripts/run_partition_all.sh data/scene data/work 1 configs/partition.json
 - `manifest.json` 记录 Region 边界、所有权、输出对象顺序和相关文件路径。
 
 更完整的中间结果定义参见 [自适应切分产物说明](docs/partition-artifacts.md)。
+
+## Scene 语义分割
+
+Scene 语义分割使用 Mosaic3D 提取全局开放词汇 3D 特征，使用 SAM3 分割渲染视图，再采用 Open3DIS 风格的几何提升和跨视角关联生成 3D 实例。程序会独立处理 `data/scene` 下的每个受支持文件。自适应切分不是该阶段的输入。
+
+### 额外环境要求
+
+推理环境需要同时包含 Mosaic3D、SAM3 和 SceneCompose 的依赖。Mosaic3D 当前在 requirements 中固定了 PyTorch 2.2.2，应围绕这一版本配置服务器 CUDA 环境，再将 SAM3 安装到同一环境。SceneCompose 不会自动安装或下载模型权重。
+
+使用 Mamba 时，创建独立的 Python 3.10 推理环境：
+
+```bash
+mamba create -n scenecompose-seg -c conda-forge python=3.10 pip
+mamba activate scenecompose-seg
+python -m pip install -r Mosaic3D/requirements.txt
+python -m pip install -e sam3
+python -m pip install -e .
+```
+
+使用 Pixi 时，先固定 Python 3.10 并安装 SceneCompose 锁定依赖，再把两个本地模型仓库安装进 Pixi 环境：
+
+```bash
+pixi add "python=3.10.*"
+pixi install
+pixi run python -m pip install -r Mosaic3D/requirements.txt
+pixi run python -m pip install -e sam3
+pixi run python -m pip install -e .
+```
+
+安装前需要检查 `Mosaic3D/requirements.txt` 中的 CUDA wheel 是否与服务器驱动匹配。以上命令不下载 checkpoint。
+
+### 权重配置
+
+将权重放到本地后，修改 `configs/segmentation.json`。默认路径为：
+
+```text
+weights/mosaic3d.ckpt
+weights/sam3.pt
+```
+
+`mosaic3d.text_model_id` 指定的 ReCap-CLIP 文本编码器必须已经存在于本地 Hugging Face cache。推理会强制使用离线模式；缺失时直接报错，不会自动下载。
+
+### 运行
+
+首先只检查 Scene 发现、路径、checkpoint 和 GPU 分配，不执行推理：
+
+```bash
+scenecompose segment-scenes \
+  --scene-root data/scene \
+  --output-root data/work \
+  --config configs/segmentation.json \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --workers 8 \
+  --dry-run
+```
+
+检查通过后移除 `--dry-run` 即可运行完整 pipeline，也可以使用：
+
+```bash
+bash scripts/run_segmentation.sh data/scene data/work 0,1,2,3,4,5,6,7 8
+```
+
+默认启用 `--resume`。例如 `--force-stage sam3` 会使 SAM3 及其后续结果失效并重新计算，同时保留几何、视图和 Mosaic3D 结果。有效阶段名为 `geometry`、`views`、`mosaic3d`、`sam3`、`fusion` 和 `export`。
+
+每个 Scene 输出到 `data/work/<scene-id>/segmentation`。主要结果包括 `fusion/point_labels.npz`、`fusion/face_labels.npz`、`fusion/instances.json`、`visualization/semantic.ply` 和 `visualization/instances.ply`。字段和坐标约定参见 `docs/segmentation-artifacts.md`。

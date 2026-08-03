@@ -1,0 +1,31 @@
+{
+  "vocabulary": [
+    {"id": 0, "name": "wall", "synonyms": ["interior wall"], "kind": "stuff"},
+    {"id": 1, "name": "floor", "synonyms": ["ground", "floor surface"], "kind": "stuff"},
+    {"id": 2, "name": "ceiling", "synonyms": [], "kind": "stuff"},
+    {"id": 3, "name": "table", "synonyms": ["dining table", "side table"], "kind": "thing"},
+    {"id": 4, "name": "desk", "synonyms": ["work desk"], "kind": "thing"},
+    {"id": 5, "name": "counter", "synonyms": ["countertop", "kitchen counter"], "kind": "thing"},
+    {"id": 6, "name": "shelf", "synonyms": ["bookshelf", "shelving unit"], "kind": "thing"},
+    {"id": 7, "name": "cabinet", "synonyms": ["cupboard"], "kind": "thing"},
+    {"id": 8, "name": "chair", "synonyms": ["seat"], "kind": "thing"},
+    {"id": 9, "name": "sofa", "synonyms": ["couch"], "kind": "thing"},
+    {"id": 10, "name": "bed", "synonyms": [], "kind": "thing"},
+    {"id": 11, "name": "sink", "synonyms": ["washbasin"], "kind": "thing"},
+    {"id": 12, "name": "toilet", "synonyms": [], "kind": "thing"},
+    {"id": 13, "name": "door", "synonyms": [], "kind": "thing"},
+    {"id": 14, "name": "window", "synonyms": [], "kind": "thing"},
+    {"id": 15, "name": "lamp", "synonyms": ["light fixture"], "kind": "thing"},
+    {"id": 16, "name": "plant", "synonyms": ["potted plant"], "kind": "thing"},
+    {"id": 17, "name": "cup", "synonyms": ["mug"], "kind": "thing"},
+    {"id": 18, "name": "bottle", "synonyms": [], "kind": "thing"},
+    {"id": 19, "name": "book", "synonyms": [], "kind": "thing"},
+    {"id": 20, "name": "monitor", "synonyms": ["computer monitor", "display"], "kind": "thing"}
+  ],
+  "geometry": {"sample_count": 500000, "seed": 20260803, "meters_per_blender_unit": null, "neutral_rgb": [128, 128, 128]},
+  "render": {"width": 1024, "height": 1024, "engine": "BLENDER_EEVEE_NEXT", "horizontal_fov_deg": 75.0, "azimuths_deg": [0, 90, 180, 270], "elevations_deg": [-15, 10, 30], "cell_size_m": 5.0, "min_depth_coverage": 0.08, "target_surface_coverage": 0.95, "min_point_observations": 2, "max_views": 256},
+  "mosaic3d": {"repository": "Mosaic3D", "checkpoint": "weights/mosaic3d.ckpt", "hydra_config": "train_spunet_multidata_ppt", "condition": "ScanNet", "text_model_id": "hf-hub:UCSC-VLAA/ViT-L-16-HTxt-Recap-CLIP", "voxel_size_m": 0.02, "chunk_points": 1000000, "chunk_overlap_m": 0.25, "top_k": 5, "unknown_confidence": 0.25, "unknown_margin": 0.05},
+  "sam3": {"repository": "sam3", "checkpoint": "weights/sam3.pt", "bpe_path": null, "image_batch_size": 4, "score_threshold": 0.25, "min_mask_area_px": 64, "max_border_fraction": 0.95},
+  "fusion": {"lift_radius_m": 0.035, "depth_tolerance_m": 0.05, "association_grid_m": 0.5, "association_threshold": 0.55, "min_instance_points": 50, "min_instance_views": 2, "mosaic_weight": 0.45, "sam3_weight": 0.35, "view_weight": 0.10, "visibility_weight": 0.10, "face_semantic_vote": 0.45, "face_instance_vote": 0.55},
+  "runtime": {"schema_version": 1, "gpus": [0], "workers": 1, "supported_suffixes": [".fbx"]}
+}
