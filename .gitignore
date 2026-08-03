@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+data/scene/
+data/obj/
+data/work/
+data/output/
+
+CoSMo3D/
+Mosaic3D/
+Open3DIS/
+sam3/
+WarpConvNet/
+configs/local.json
+
+# pixi environments
+.pixi/*
+!.pixi/config.toml

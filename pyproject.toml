@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scenecompose"
+version = "0.1.0"
+description = "Adaptive scene partitioning and 3D object composition pipeline"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26,<3",
+]
+
+[project.scripts]
+scenecompose = "scenecompose.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scenecompose"]
+
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["win-64"]
+
+[tool.pixi.pypi-dependencies]
+scenecompose = { path = ".", editable = true }
+
+[tool.pixi.tasks]

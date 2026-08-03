@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "max_triangles_per_region": 1500000,
+  "max_estimated_points_per_region": 250000,
+  "max_xy_extent_m": 8.0,
+  "halo_m": 0.75,
+  "min_split_extent_m": 0.25,
+  "point_density_per_m2": 2500.0,
+  "meters_per_blender_unit": null,
+  "export_format": "blend",
+  "include_materials": true
+}
