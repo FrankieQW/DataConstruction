@@ -17,6 +17,20 @@ This repository currently implements stage 1. It targets Linux servers and runs 
 - Blender 4.5 LTS available as `blender` or through `SCENECOMPOSE_BLENDER`
 - NumPy in the orchestration environment; Blender's bundled Python must also provide NumPy
 
+#### Third-party source repositories
+
+The complete pipeline expects the following repositories to exist directly under the SceneCompose project root. Run these commands from the project root so the generated directory names match the configured paths:
+
+```bash
+git clone https://github.com/NVlabs/WarpConvNet.git
+git clone https://github.com/facebookresearch/sam3.git
+git clone https://github.com/VinAIResearch/Open3DIS.git
+git clone https://github.com/JinLi998/CoSMo3D.git
+git clone https://github.com/NVlabs/Mosaic3D.git
+```
+
+These repositories are reserved for the later segmentation and composition stages and remain isolated from the core orchestration package. Adaptive partitioning itself does not import them.
+
 No model weights are needed for partitioning.
 
 ### Install

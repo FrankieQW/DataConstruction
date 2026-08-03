@@ -19,6 +19,20 @@ SceneCompose 整体分为三个主要阶段：
 - Blender 4.5 LTS，可通过 `blender` 命令调用，或由 `SCENECOMPOSE_BLENDER` 环境变量指定
 - SceneCompose Python 环境需要安装 NumPy；Blender 内置的 Python 也必须提供 NumPy
 
+#### 第三方源码仓库
+
+完整 pipeline 要求以下仓库直接位于 SceneCompose 项目根目录。请在项目根目录执行这些命令，确保生成的目录名与配置路径一致：
+
+```bash
+git clone https://github.com/NVlabs/WarpConvNet.git
+git clone https://github.com/facebookresearch/sam3.git
+git clone https://github.com/VinAIResearch/Open3DIS.git
+git clone https://github.com/JinLi998/CoSMo3D.git
+git clone https://github.com/NVlabs/Mosaic3D.git
+```
+
+这些仓库供后续 Scene 语义/实例分割与组合阶段使用，并与核心编排包保持隔离。自适应切分阶段本身不会导入这些仓库。
+
 Scene 切分阶段不需要任何模型权重。
 
 ### 安装
