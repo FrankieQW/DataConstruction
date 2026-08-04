@@ -209,9 +209,17 @@ Edit `configs/segmentation.json` after placing weights locally:
 ```text
 weights/mosaic3d.ckpt
 weights/sam3.pt
+weights/recap-clip/
+├── open_clip_config.json
+├── open_clip_pytorch_model.bin
+├── added_tokens.json
+├── tokenizer.json
+├── tokenizer_config.json
+├── special_tokens_map.json
+└── vocab.txt
 ```
 
-The ReCap-CLIP text encoder named by `mosaic3d.text_model_id` must already exist in the local Hugging Face cache. Inference forces offline mode and fails instead of downloading missing files.
+ReCap-CLIP is loaded directly from the flat directory configured by `mosaic3d.text_model_path` (default: `weights/recap-clip`). It does not use a Hugging Face model ID or cache layout and never downloads missing files. `configuration.json` may also remain in this directory but is optional.
 
 ### Run
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-import os
 from pathlib import Path
 import sys
 from typing import Iterator
@@ -10,6 +9,7 @@ import numpy as np
 
 from .artifacts import save_npz_atomic
 from .config import SegmentationConfig
+from .recap_clip import load_local_recap_clip
 
 
 @contextmanager
@@ -40,6 +40,7 @@ class Mosaic3DAdapter:
         self.device = device
         self.repository = (project_root / config.mosaic3d.repository).resolve()
         self.checkpoint = (project_root / config.mosaic3d.checkpoint).resolve()
+        self.text_model_path = (project_root / config.mosaic3d.text_model_path).resolve()
         self._torch = None
         self._module = None
         self._text_encoder = None
@@ -47,8 +48,6 @@ class Mosaic3DAdapter:
     def _load(self) -> None:
         if self._module is not None:
             return
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         with _repository_import(self.repository):
             import torch
             from hydra import compose, initialize_config_dir
@@ -63,9 +62,7 @@ class Mosaic3DAdapter:
             if hard_missing:
                 raise RuntimeError(f"Mosaic3D checkpoint is missing network keys: {hard_missing[:8]}")
             module.net.to(self.device).eval()
-            from src.models.utils.clip_models import build_clip_model
-            text_encoder = build_clip_model({"model_id": self.config.mosaic3d.text_model_id}, device=self.device)
-            text_encoder.eval()
+            text_encoder = load_local_recap_clip(self.text_model_path, self.device)
         self._torch = torch
         self._module = module
         self._text_encoder = text_encoder

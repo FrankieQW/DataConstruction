@@ -6,6 +6,7 @@ import shutil
 import sys
 
 from .config import SegmentationConfig
+from .recap_clip import required_recap_clip_paths
 
 
 class PreflightError(RuntimeError):
@@ -27,13 +28,17 @@ def run_preflight(project_root: Path, output_root: Path, config: SegmentationCon
     if not sys.platform.startswith("linux"):
         message = f"Server execution requires Linux; current platform is {sys.platform}"
         (warnings if dry_run else failures).append(message)
+    text_model_dir = project_root / config.mosaic3d.text_model_path
     required = {
         "Mosaic3D repository": project_root / config.mosaic3d.repository,
         "SAM3 repository": project_root / config.sam3.repository,
         "Open3DIS repository": project_root / "Open3DIS",
         "Mosaic3D checkpoint": project_root / config.mosaic3d.checkpoint,
+        "ReCap-CLIP model directory": text_model_dir,
         "SAM3 checkpoint": project_root / config.sam3.checkpoint,
     }
+    if text_model_dir.is_dir():
+        required.update({f"ReCap-CLIP {name}": path for name, path in required_recap_clip_paths(text_model_dir).items()})
     if config.sam3.bpe_path:
         required["SAM3 BPE vocabulary"] = project_root / config.sam3.bpe_path
     for label, path in required.items():

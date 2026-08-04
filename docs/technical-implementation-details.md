@@ -233,7 +233,15 @@ Blender 相机局部观察方向为 `-Z`，局部向上为 `+Y`。像素原点�
 
 ### 4.5 Mosaic3D：开放词汇点语义
 
-`Mosaic3DAdapter` 强制设置 Hugging Face 和 Transformers 离线模式，从本地仓库和 checkpoint 加载网络。表面点先按 `voxel_size_m` 体素化：
+`Mosaic3DAdapter` 从本地仓库和 checkpoint 加载 3D 网络。ReCap-CLIP 不通过 Hugging Face Hub 或缓存加载，而是从 `mosaic3d.text_model_path`（默认 `weights/recap-clip`）直接读取：
+
+- `open_clip_config.json` 中的 `model_cfg` 用于构建 `open_clip.CLIP`；
+- `open_clip_pytorch_model.bin` 通过 OpenCLIP checkpoint loader 严格加载；
+- `added_tokens.json`、`tokenizer.json`、`tokenizer_config.json`、`special_tokens_map.json` 和 `vocab.txt` 由 `HFTokenizer` 以 `local_files_only=True` 从同一目录加载。
+
+这里的 `HFTokenizer` 是 OpenCLIP 对 Transformers tokenizer 的封装，不表示通过 Hugging Face Hub 读取文件。预检会在 worker 启动前验证本地目录和全部必需文件；这些文件的大小或修改时间发生变化时，Mosaic3D 阶段的 resume 指纹也会变化。ReCap-CLIP 在当前流程中只负责文本编码，因此不构建图像预处理器。
+
+表面点先按 `voxel_size_m` 体素化：
 
 1. 坐标减去体素点均值进行中心化。
 2. RGB 映射到 `[-1, 1]` 作为输入特征。

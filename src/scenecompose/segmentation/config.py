@@ -73,7 +73,7 @@ class MosaicConfig:
     checkpoint: str = "weights/mosaic3d.ckpt"
     hydra_config: str = "train_spunet_multidata_ppt"
     condition: str = "ScanNet"
-    text_model_id: str = "hf-hub:UCSC-VLAA/ViT-L-16-HTxt-Recap-CLIP"
+    text_model_path: str = "weights/recap-clip"
     voxel_size_m: float = 0.02
     chunk_points: int = 1_000_000
     chunk_overlap_m: float = 0.25
@@ -165,6 +165,8 @@ class SegmentationConfig:
             raise ValueError(f"Unsupported runtime schema_version: {self.runtime.schema_version}")
         if self.geometry.meters_per_blender_unit is not None and self.geometry.meters_per_blender_unit <= 0:
             raise ValueError("geometry.meters_per_blender_unit must be positive when set")
+        if not self.mosaic3d.text_model_path.strip():
+            raise ValueError("mosaic3d.text_model_path must not be empty")
         if not self.runtime.gpus or any(gpu < 0 for gpu in self.runtime.gpus):
             raise ValueError("runtime.gpus must contain non-negative GPU ids")
         if (

@@ -18,12 +18,21 @@ from .lifting import lift_all_masks
 from .manifest import STAGES, SegmentationManifest
 from .mosaic import Mosaic3DAdapter
 from .preflight import run_preflight
+from .recap_clip import required_recap_clip_paths
 from .sam3_adapter import Sam3Adapter
 from .observation_discovery import ObservationInput, discover_observations
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 BLENDER_SCRIPT = PROJECT_ROOT / "scripts" / "blender" / "prepare_segmentation_scene.py"
+
+
+def _mosaic_external_files(config: SegmentationConfig) -> tuple[Path, ...]:
+    text_model_dir = (PROJECT_ROOT / config.mosaic3d.text_model_path).resolve()
+    return (
+        (PROJECT_ROOT / config.mosaic3d.checkpoint).resolve(),
+        *required_recap_clip_paths(text_model_dir).values(),
+    )
 
 
 def _stage(
@@ -92,7 +101,7 @@ def run_scene(
         lambda: Mosaic3DAdapter(PROJECT_ROOT, config, "cuda:0").infer(
             output / "geometry" / "samples.npz", output / "mosaic3d"
         ),
-        external_files=((PROJECT_ROOT / config.mosaic3d.checkpoint).resolve(),),
+        external_files=_mosaic_external_files(config),
     )
     upstream = _stage(
         manifest, "sam3", config, upstream, resume, logs / "sam3.log",
@@ -164,7 +173,7 @@ def run_observation(
         manifest, "mosaic3d", config, upstream, resume, logs / "mosaic3d.log",
         lambda: Mosaic3DAdapter(PROJECT_ROOT, config, "cuda:0").infer(
             output / "geometry" / "samples.npz", output / "mosaic3d"
-        ), external_files=((PROJECT_ROOT / config.mosaic3d.checkpoint).resolve(),),
+        ), external_files=_mosaic_external_files(config),
     )
     upstream = _stage(
         manifest, "sam3", config, upstream, resume, logs / "sam3.log",

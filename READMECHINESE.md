@@ -162,9 +162,17 @@ scenecompose partition-all \
 ```text
 weights/mosaic3d.ckpt
 weights/sam3.pt
+weights/recap-clip/
+├── open_clip_config.json
+├── open_clip_pytorch_model.bin
+├── added_tokens.json
+├── tokenizer.json
+├── tokenizer_config.json
+├── special_tokens_map.json
+└── vocab.txt
 ```
 
-ReCap-CLIP 文本编码器也必须已存在于本地 Hugging Face 缓存。推理使用离线模式，不会自动下载缺失文件。
+ReCap-CLIP 从 `mosaic3d.text_model_path` 配置的平铺本地目录直接加载，默认目录为 `weights/recap-clip`。运行时不再使用 Hugging Face 模型 ID 或缓存结构，也不会自动下载缺失文件。下载目录中的 `configuration.json` 可以保留，但不是当前加载器的必需文件。
 
 先做只读预检和任务分配检查：
 
