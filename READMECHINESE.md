@@ -2,6 +2,8 @@
 
 [English README](README.md)
 
+三阶段的代码级算法、数据流、产物契约和当前限制见 [技术实现细节](docs/technical-implementation-details.md)。
+
 SceneCompose 按 Inline Execution 组织为三个大步骤：
 
 1. 基于观察锚点的 Scene 局部切分；

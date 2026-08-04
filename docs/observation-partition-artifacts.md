@@ -18,6 +18,8 @@ data/work/<scene-id>/observations/
 
 `scene_partition.glb` contains complete selected triangles. A triangle is retained when its centroid, a vertex, or an edge midpoint intersects the expanded Context sector. Geometry is not removed based on camera occlusion.
 
+All selected sources are merged into one `partition_merged` mesh before GLB export. Only materials used by selected polygons are attached. Valid materials are reused; a private copy is created only when invalid zero-size image nodes must be removed. This reduces glTF work without changing face provenance.
+
 `source_faces.npz` stores one row per exported triangle:
 
 - `output_triangle_index`

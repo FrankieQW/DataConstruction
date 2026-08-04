@@ -1,5 +1,7 @@
 # SceneCompose
 
+For a code-level description of all three stages, see [Technical implementation details (Chinese)](docs/technical-implementation-details.md).
+
 SceneCompose is organized as three large stages:
 
 1. observer-centered scene partitioning;

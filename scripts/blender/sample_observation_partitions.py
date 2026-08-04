@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 import shutil
 import sys
+import time
 import uuid
 
 import bpy
@@ -34,10 +35,37 @@ class MeshSource:
 
 
 @dataclass(frozen=True)
+class SourceGeometry:
+    source: MeshSource
+    vertices: np.ndarray
+    triangles: np.ndarray
+    loops: np.ndarray
+    polygons: np.ndarray
+    centroids: np.ndarray
+    normals: np.ndarray
+    areas: np.ndarray
+    polygon_smooth: np.ndarray
+    polygon_material: np.ndarray
+    bounds_min: np.ndarray
+    bounds_max: np.ndarray
+    uv_name: str | None
+    loop_uv: np.ndarray | None
+    materials: tuple[object | None, ...]
+
+
+@dataclass(frozen=True)
 class AnchorCandidate:
     floor: tuple[float, float, float]
     component_id: int
     component_area_m2: float
+
+
+def _log(message: str) -> None:
+    print(f"[SceneCompose] {message}", flush=True)
+
+
+def _seconds(start: float) -> str:
+    return f"{time.perf_counter() - start:.2f}s"
 
 
 def _arguments() -> argparse.Namespace:
@@ -100,48 +128,88 @@ def _mesh_sources(depsgraph: bpy.types.Depsgraph) -> list[MeshSource]:
     return sources
 
 
-def _extract_source(source: MeshSource, depsgraph: bpy.types.Depsgraph):
+def _extract_source(source: MeshSource, depsgraph: bpy.types.Depsgraph) -> SourceGeometry:
     evaluated = source.source_object.evaluated_get(depsgraph)
     mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
-    mesh.calc_loop_triangles()
-    vertices_local = np.empty((len(mesh.vertices), 3), dtype=np.float64)
-    mesh.vertices.foreach_get("co", vertices_local.ravel())
-    homogeneous = np.ones((len(vertices_local), 4), dtype=np.float64)
-    homogeneous[:, :3] = vertices_local
-    matrix = np.asarray(source.matrix_world, dtype=np.float64).reshape((4, 4))
-    vertices = (homogeneous @ matrix.T)[:, :3]
-    triangles = np.empty((len(mesh.loop_triangles), 3), dtype=np.int32)
-    loops = np.empty((len(mesh.loop_triangles), 3), dtype=np.int32)
-    polygons = np.empty(len(mesh.loop_triangles), dtype=np.int32)
-    mesh.loop_triangles.foreach_get("vertices", triangles.ravel())
-    mesh.loop_triangles.foreach_get("loops", loops.ravel())
-    mesh.loop_triangles.foreach_get("polygon_index", polygons)
-    corners = vertices[triangles]
-    cross = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
-    double_area = np.linalg.norm(cross, axis=1)
-    normals = np.divide(cross, double_area[:, None], out=np.zeros_like(cross), where=double_area[:, None] > 1e-12)
-    centroids = corners.mean(axis=1)
-    return evaluated, mesh, vertices, triangles, loops, polygons, corners, centroids, normals, double_area * 0.5
+    try:
+        mesh.calc_loop_triangles()
+        vertices_local = np.empty((len(mesh.vertices), 3), dtype=np.float32)
+        mesh.vertices.foreach_get("co", vertices_local.ravel())
+        homogeneous = np.ones((len(vertices_local), 4), dtype=np.float64)
+        homogeneous[:, :3] = vertices_local
+        matrix = np.asarray(source.matrix_world, dtype=np.float64).reshape((4, 4))
+        vertices = (homogeneous @ matrix.T)[:, :3].astype(np.float32)
+        triangles = np.empty((len(mesh.loop_triangles), 3), dtype=np.int32)
+        loops = np.empty((len(mesh.loop_triangles), 3), dtype=np.int32)
+        polygons = np.empty(len(mesh.loop_triangles), dtype=np.int32)
+        mesh.loop_triangles.foreach_get("vertices", triangles.ravel())
+        mesh.loop_triangles.foreach_get("loops", loops.ravel())
+        mesh.loop_triangles.foreach_get("polygon_index", polygons)
+        corners = vertices[triangles]
+        cross = np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0])
+        double_area = np.linalg.norm(cross, axis=1)
+        normals = np.divide(
+            cross, double_area[:, None], out=np.zeros_like(cross),
+            where=double_area[:, None] > 1e-12,
+        ).astype(np.float32)
+        centroids = corners.mean(axis=1, dtype=np.float32)
+        polygon_smooth = np.empty(len(mesh.polygons), dtype=bool)
+        polygon_material = np.empty(len(mesh.polygons), dtype=np.int32)
+        if len(mesh.polygons):
+            mesh.polygons.foreach_get("use_smooth", polygon_smooth)
+            mesh.polygons.foreach_get("material_index", polygon_material)
+        active_uv = mesh.uv_layers.active
+        loop_uv = None
+        uv_name = None
+        if active_uv is not None:
+            uv_name = active_uv.name
+            loop_uv = np.empty((len(mesh.loops), 2), dtype=np.float32)
+            active_uv.data.foreach_get("uv", loop_uv.ravel())
+        return SourceGeometry(
+            source=source,
+            vertices=vertices,
+            triangles=triangles,
+            loops=loops,
+            polygons=polygons,
+            centroids=centroids,
+            normals=normals,
+            areas=(double_area * 0.5).astype(np.float32),
+            polygon_smooth=polygon_smooth,
+            polygon_material=polygon_material,
+            bounds_min=(vertices.min(axis=0) if len(vertices) else np.zeros(3, dtype=np.float32)),
+            bounds_max=(vertices.max(axis=0) if len(vertices) else np.zeros(3, dtype=np.float32)),
+            uv_name=uv_name,
+            loop_uv=loop_uv,
+            materials=tuple(mesh.materials),
+        )
+    finally:
+        evaluated.to_mesh_clear()
 
 
-def _collect_geometry(sources: list[MeshSource], depsgraph: bpy.types.Depsgraph) -> dict[str, np.ndarray]:
+def _collect_geometry(
+    sources: list[MeshSource], depsgraph: bpy.types.Depsgraph,
+) -> tuple[dict[str, np.ndarray], tuple[SourceGeometry, ...]]:
     result: dict[str, list[np.ndarray]] = {key: [] for key in ("centroids", "areas", "normals", "source_indices", "triangle_indices")}
+    cached: list[SourceGeometry] = []
     for source_index, source in enumerate(sources):
-        evaluated, mesh, _, triangles, _, _, _, centroids, normals, areas = _extract_source(source, depsgraph)
-        try:
-            count = len(triangles)
-            if not count:
-                continue
-            result["centroids"].append(centroids)
-            result["areas"].append(areas)
-            result["normals"].append(normals)
-            result["source_indices"].append(np.full(count, source_index, dtype=np.int32))
-            result["triangle_indices"].append(np.arange(count, dtype=np.int64))
-        finally:
-            evaluated.to_mesh_clear()
+        if source_index and source_index % 500 == 0:
+            _log(f"geometry cache progress: {source_index}/{len(sources)} sources")
+        geometry = _extract_source(source, depsgraph)
+        cached.append(geometry)
+        count = len(geometry.triangles)
+        if not count:
+            continue
+        result["centroids"].append(geometry.centroids)
+        result["areas"].append(geometry.areas)
+        result["normals"].append(geometry.normals)
+        result["source_indices"].append(np.full(count, source_index, dtype=np.int32))
+        result["triangle_indices"].append(np.arange(count, dtype=np.int64))
     if not result["centroids"]:
         raise RuntimeError("Scene contains no triangles")
-    return {key: np.concatenate(parts, axis=0) for key, parts in result.items()}
+    return (
+        {key: np.concatenate(parts, axis=0) for key, parts in result.items()},
+        tuple(cached),
+    )
 
 
 def _floor_components(geometry: dict[str, np.ndarray], config: ObservationPartitionConfig) -> list[np.ndarray]:
@@ -186,22 +254,21 @@ def _floor_components(geometry: dict[str, np.ndarray], config: ObservationPartit
     return components
 
 
-def _sample_on_triangles(indices: np.ndarray, geometry: dict[str, np.ndarray], sources: list[MeshSource], depsgraph, rng, corner_cache: dict[int, np.ndarray]) -> np.ndarray:
+def _sample_on_triangles(
+    indices: np.ndarray, geometry: dict[str, np.ndarray],
+    source_geometry: tuple[SourceGeometry, ...], rng,
+) -> np.ndarray:
     areas = geometry["areas"][indices]
     selected_global = int(rng.choice(indices, p=areas / areas.sum()))
     source_index = int(geometry["source_indices"][selected_global])
     triangle_index = int(geometry["triangle_indices"][selected_global])
-    if source_index not in corner_cache:
-        evaluated, mesh, _, _, _, _, corners, _, _, _ = _extract_source(sources[source_index], depsgraph)
-        try:
-            corner_cache[source_index] = corners.copy()
-        finally:
-            evaluated.to_mesh_clear()
+    cached = source_geometry[source_index]
+    corners = cached.vertices[cached.triangles[triangle_index]]
     uv = rng.random(2)
     if uv.sum() > 1.0:
         uv = 1.0 - uv
     barycentric = np.asarray((1.0 - uv.sum(), uv[0], uv[1]))
-    return barycentric @ corner_cache[source_index][triangle_index]
+    return barycentric @ corners
 
 
 def _ray_clear(origin: np.ndarray, direction: np.ndarray, distance: float, depsgraph) -> bool:
@@ -259,19 +326,18 @@ def _choose_direction(anchor: np.ndarray, geometry: dict[str, np.ndarray], confi
     return best
 
 
-def _sample_anchors(components, geometry, sources, depsgraph, config, scene_hash):
+def _sample_anchors(components, geometry, source_geometry, depsgraph, config, scene_hash):
     seed = config.seed + int(scene_hash[:8], 16)
     rng = np.random.default_rng(seed % (2**63 - 1))
     component_areas = np.asarray([geometry["areas"][component].sum() for component in components], dtype=np.float64)
     anchors: list[tuple[AnchorCandidate, np.ndarray]] = []
-    corner_cache: dict[int, np.ndarray] = {}
     max_attempts = config.observations_per_scene * config.anchor_attempts_per_output
     for _ in range(max_attempts):
         if len(anchors) >= config.observations_per_scene or not len(components):
             break
         component_id = int(rng.choice(len(components), p=component_areas / component_areas.sum()))
         point = _sample_on_triangles(
-            components[component_id], geometry, sources, depsgraph, rng, corner_cache
+            components[component_id], geometry, source_geometry, rng
         )
         if any(np.linalg.norm(point[:2] - np.asarray(item[0].floor[:2])) < config.min_anchor_spacing_m for item in anchors):
             continue
@@ -285,7 +351,10 @@ def _sample_anchors(components, geometry, sources, depsgraph, config, scene_hash
     return anchors
 
 
-def _select_source_triangles(corners, centroids, anchor, forward, config):
+def _select_source_triangles(
+    geometry: SourceGeometry, anchor: np.ndarray, forward: np.ndarray,
+    config: ObservationPartitionConfig,
+) -> tuple[np.ndarray, np.ndarray]:
     expansion = config.camera_motion_radius_m + config.context_margin_m
     context_radius = config.radius_m + expansion
     context_half_angle = math.radians(config.horizontal_angle_deg * 0.5) + math.atan2(expansion, config.radius_m)
@@ -294,63 +363,212 @@ def _select_source_triangles(corners, centroids, anchor, forward, config):
     core_max = anchor[2] + config.vertical_above_anchor_m
     context_min = core_min - config.context_margin_m
     context_max = core_max + config.context_margin_m
-    midpoints = np.stack(((corners[:, 0] + corners[:, 1]) * 0.5, (corners[:, 1] + corners[:, 2]) * 0.5, (corners[:, 2] + corners[:, 0]) * 0.5), axis=1)
-    samples = np.concatenate((centroids[:, None, :], corners, midpoints), axis=1)
-    context = np.zeros(len(centroids), dtype=bool)
-    for sample_index in range(samples.shape[1]):
-        context |= _inside_sector(samples[:, sample_index], anchor, forward, context_radius, context_half_angle, context_min, context_max)
-    core = _inside_sector(centroids, anchor, forward, config.radius_m, core_half_angle, core_min, core_max)
+    if geometry.bounds_max[2] < context_min or geometry.bounds_min[2] > context_max:
+        empty = np.zeros(len(geometry.triangles), dtype=bool)
+        return empty, empty.copy()
+    delta_x = max(
+        float(geometry.bounds_min[0] - anchor[0]), 0.0,
+        float(anchor[0] - geometry.bounds_max[0]),
+    )
+    delta_y = max(
+        float(geometry.bounds_min[1] - anchor[1]), 0.0,
+        float(anchor[1] - geometry.bounds_max[1]),
+    )
+    if math.hypot(delta_x, delta_y) > context_radius:
+        empty = np.zeros(len(geometry.triangles), dtype=bool)
+        return empty, empty.copy()
+    context = _inside_sector(
+        geometry.centroids, anchor, forward, context_radius,
+        context_half_angle, context_min, context_max,
+    )
+    triangle_vertices = geometry.triangles
+    for corner_index in range(3):
+        corners = geometry.vertices[triangle_vertices[:, corner_index]]
+        context |= _inside_sector(
+            corners, anchor, forward, context_radius,
+            context_half_angle, context_min, context_max,
+        )
+    for left, right in ((0, 1), (1, 2), (2, 0)):
+        midpoint = (
+            geometry.vertices[triangle_vertices[:, left]]
+            + geometry.vertices[triangle_vertices[:, right]]
+        ) * 0.5
+        context |= _inside_sector(
+            midpoint, anchor, forward, context_radius,
+            context_half_angle, context_min, context_max,
+        )
+    core = _inside_sector(
+        geometry.centroids, anchor, forward, config.radius_m,
+        core_half_angle, core_min, core_max,
+    )
     return context, core
 
 
-def _create_partition_object(source, source_index, depsgraph, anchor, forward, config):
-    evaluated, mesh, vertices, triangles, loops, polygons, corners, centroids, _, _ = _extract_source(source, depsgraph)
-    try:
-        selected, core_all = _select_source_triangles(corners, centroids, anchor, forward, config)
-        if not np.any(selected):
-            return None, None
-        selected_triangles = triangles[selected]
+def _sanitized_material_copy(
+    material, resolved: dict[int, object], owned: list[object],
+    removed_images: set[str],
+):
+    key = int(material.as_pointer())
+    if key in resolved:
+        return resolved[key]
+    invalid_names = []
+    if material.use_nodes and material.node_tree is not None:
+        for node in material.node_tree.nodes:
+            image = getattr(node, "image", None)
+            if node.type == "TEX_IMAGE" and image is not None:
+                size = tuple(int(value) for value in image.size)
+                if len(size) < 2 or size[0] <= 0 or size[1] <= 0:
+                    invalid_names.append(str(image.name))
+    if not invalid_names:
+        resolved[key] = material
+        return material
+    copied = material.copy()
+    copied.name = f"SceneCompose_{material.name}"
+    for node in list(copied.node_tree.nodes):
+        image = getattr(node, "image", None)
+        if node.type == "TEX_IMAGE" and image is not None and str(image.name) in invalid_names:
+            copied.node_tree.nodes.remove(node)
+    removed_images.update(invalid_names)
+    owned.append(copied)
+    resolved[key] = copied
+    return copied
+
+
+def _create_partition_object(
+    source_geometry: tuple[SourceGeometry, ...], anchor: np.ndarray,
+    forward: np.ndarray, config: ObservationPartitionConfig,
+):
+    vertex_parts: list[np.ndarray] = []
+    triangle_parts: list[np.ndarray] = []
+    smooth_parts: list[np.ndarray] = []
+    material_index_parts: list[np.ndarray] = []
+    uv_layer_names = sorted({
+        geometry.uv_name for geometry in source_geometry
+        if geometry.uv_name is not None and geometry.loop_uv is not None
+    })
+    uv_parts: dict[str, list[np.ndarray]] = {name: [] for name in uv_layer_names}
+    mapping_parts: dict[str, list[np.ndarray]] = {
+        key: [] for key in (
+            "source_object_index", "source_instance_index", "source_polygon_index",
+            "is_core", "is_context",
+        )
+    }
+    resolved_materials: dict[int, object] = {}
+    owned_materials: list[object] = []
+    output_materials: list[object] = []
+    output_material_slots: dict[int, int] = {}
+    removed_images: set[str] = set()
+    selected_source_count = 0
+    vertex_offset = 0
+
+    def material_slot(material) -> int:
+        key = int(material.as_pointer()) if material is not None else 0
+        if key not in output_material_slots:
+            if material is None:
+                copied = bpy.data.materials.new("SceneCompose_MissingMaterial")
+                copied.diffuse_color = (0.5, 0.5, 0.5, 1.0)
+                owned_materials.append(copied)
+                resolved_materials[key] = copied
+            else:
+                copied = _sanitized_material_copy(
+                    material, resolved_materials, owned_materials, removed_images
+                )
+            output_material_slots[key] = len(output_materials)
+            output_materials.append(copied)
+        return output_material_slots[key]
+
+    for source_index, geometry in enumerate(source_geometry):
+        if source_index and source_index % 500 == 0:
+            _log(
+                f"partition build progress: {source_index}/{len(source_geometry)} sources; "
+                f"selected={selected_source_count}"
+            )
+        if not len(geometry.triangles):
+            continue
+        selected, core_all = _select_source_triangles(geometry, anchor, forward, config)
+        selected_indices = np.flatnonzero(selected)
+        if not len(selected_indices):
+            continue
+        selected_source_count += 1
+        selected_triangles = geometry.triangles[selected_indices]
         unique_vertices, inverse = np.unique(selected_triangles.ravel(), return_inverse=True)
         output_triangles = inverse.reshape((-1, 3)).astype(np.int32)
-        output_mesh = bpy.data.meshes.new(f"observation_{source.instance_name}_mesh")
-        output_mesh.from_pydata(vertices[unique_vertices].astype(np.float32), [], output_triangles)
-        selected_polygons = polygons[selected]
-        if len(mesh.polygons):
-            smooth = np.asarray([polygon.use_smooth for polygon in mesh.polygons], dtype=bool)
-            materials = np.asarray([polygon.material_index for polygon in mesh.polygons], dtype=np.int32)
-            for output_polygon, source_polygon in zip(output_mesh.polygons, selected_polygons):
-                output_polygon.use_smooth = bool(smooth[source_polygon])
-                if config.include_materials:
-                    output_polygon.material_index = int(materials[source_polygon])
+        vertex_parts.append(geometry.vertices[unique_vertices])
+        triangle_parts.append(output_triangles + vertex_offset)
+        vertex_offset += len(unique_vertices)
+        selected_polygons = geometry.polygons[selected_indices]
+        smooth_parts.append(geometry.polygon_smooth[selected_polygons])
         if config.include_materials:
-            for material in mesh.materials:
-                output_mesh.materials.append(material)
-        if mesh.uv_layers.active is not None:
-            source_uv = np.empty((len(mesh.loops), 2), dtype=np.float32)
-            mesh.uv_layers.active.data.foreach_get("uv", source_uv.ravel())
-            selected_loops = loops[selected].ravel()
-            target_uv = output_mesh.uv_layers.new(name=mesh.uv_layers.active.name)
-            target_uv.data.foreach_set("uv", source_uv[selected_loops].ravel())
-        output_mesh.update(calc_edges=True)
-        output_name = f"partition_{source_index:06d}"
-        output_object = bpy.data.objects.new(output_name, output_mesh)
-        bpy.context.scene.collection.objects.link(output_object)
-        mapping = {
-            "source_object_index": np.full(np.count_nonzero(selected), source_index, dtype=np.int32),
-            "source_instance_index": np.full(np.count_nonzero(selected), source_index, dtype=np.int32),
-            "source_polygon_index": selected_polygons.astype(np.int64),
-            "output_object_name": np.full(
-                np.count_nonzero(selected), output_name, dtype=f"<U{max(1, len(output_name))}"
-            ),
-            "output_triangle_index_within_object": np.arange(
-                np.count_nonzero(selected), dtype=np.int64
-            ),
-            "is_core": core_all[selected],
-            "is_context": np.ones(np.count_nonzero(selected), dtype=bool),
-        }
-        return output_object, mapping
-    finally:
-        evaluated.to_mesh_clear()
+            source_slots = geometry.polygon_material[selected_polygons]
+            target_slots = np.zeros(len(source_slots), dtype=np.int32)
+            for old_slot in np.unique(source_slots):
+                old_slot_int = int(old_slot)
+                material = (
+                    geometry.materials[old_slot_int]
+                    if 0 <= old_slot_int < len(geometry.materials) else None
+                )
+                target_slots[source_slots == old_slot_int] = material_slot(material)
+            material_index_parts.append(target_slots)
+        else:
+            material_index_parts.append(np.zeros(len(selected_indices), dtype=np.int32))
+        selected_uv = (
+            geometry.loop_uv[geometry.loops[selected_indices].ravel()]
+            if geometry.loop_uv is not None
+            else np.zeros((len(selected_indices) * 3, 2), dtype=np.float32)
+        )
+        for name in uv_layer_names:
+            # Mirroring the source's active UV into every retained active-layer
+            # name preserves both implicit and explicitly named material lookups.
+            uv_parts[name].append(selected_uv)
+        mapping_parts["source_object_index"].append(
+            np.full(len(selected_indices), source_index, dtype=np.int32)
+        )
+        mapping_parts["source_instance_index"].append(
+            np.full(len(selected_indices), source_index, dtype=np.int32)
+        )
+        mapping_parts["source_polygon_index"].append(selected_polygons.astype(np.int64))
+        mapping_parts["is_core"].append(core_all[selected_indices])
+        mapping_parts["is_context"].append(np.ones(len(selected_indices), dtype=bool))
+
+    if not triangle_parts:
+        return None, None, None
+    vertices = np.concatenate(vertex_parts, axis=0)
+    triangles = np.concatenate(triangle_parts, axis=0)
+    output_mesh = bpy.data.meshes.new("observation_partition_merged_mesh")
+    output_mesh.from_pydata(vertices, [], triangles)
+    smooth = np.concatenate(smooth_parts)
+    output_mesh.polygons.foreach_set("use_smooth", smooth)
+    if config.include_materials:
+        for material in output_materials:
+            output_mesh.materials.append(material)
+        if output_materials:
+            output_mesh.polygons.foreach_set(
+                "material_index", np.concatenate(material_index_parts)
+            )
+    for name, parts in uv_parts.items():
+        target_uv = output_mesh.uv_layers.new(name=name)
+        target_uv.data.foreach_set("uv", np.concatenate(parts, axis=0).ravel())
+    output_mesh.update(calc_edges=True)
+    output_name = "partition_merged"
+    output_object = bpy.data.objects.new(output_name, output_mesh)
+    bpy.context.scene.collection.objects.link(output_object)
+    mapping = {key: np.concatenate(parts) for key, parts in mapping_parts.items()}
+    triangle_count = len(triangles)
+    mapping["output_object_name"] = np.full(
+        triangle_count, output_name, dtype=f"<U{len(output_name)}"
+    )
+    mapping["output_triangle_index_within_object"] = np.arange(
+        triangle_count, dtype=np.int64
+    )
+    stats = {
+        "triangle_count": triangle_count,
+        "vertex_count": len(vertices),
+        "source_count": selected_source_count,
+        "material_count": len(output_materials),
+        "removed_images": sorted(removed_images),
+        "owned_materials": owned_materials,
+    }
+    return output_object, mapping, stats
 
 
 def _export_glb(path: Path, objects: list[bpy.types.Object], include_materials: bool) -> None:
@@ -376,7 +594,16 @@ def _remove_objects(objects: list[bpy.types.Object]) -> None:
             bpy.data.meshes.remove(mesh)
 
 
-def _export_observation(staging, source_reference, scene_hash, anchor_candidate, forward, sources, depsgraph, config):
+def _remove_materials(materials: list[object]) -> None:
+    for material in materials:
+        if material is not None and material.users == 0:
+            bpy.data.materials.remove(material)
+
+
+def _export_observation(
+    staging, source_reference, scene_hash, anchor_candidate, forward,
+    source_geometry, config, observation_index, observation_total,
+):
     anchor = np.asarray(anchor_candidate.floor, dtype=np.float64)
     right = np.asarray((-forward[1], forward[0], 0.0))
     config_digest = hashlib.sha256(
@@ -389,28 +616,45 @@ def _export_observation(staging, source_reference, scene_hash, anchor_candidate,
     directory = staging / identity
     partition_dir = directory / "partition"
     partition_dir.mkdir(parents=True)
-    objects = []
-    mappings: dict[str, list[np.ndarray]] = {
-        key: [] for key in (
-            "source_object_index", "source_instance_index", "source_polygon_index",
-            "output_object_name", "output_triangle_index_within_object", "is_core", "is_context",
-        )
-    }
+    objects: list[bpy.types.Object] = []
+    owned_materials: list[object] = []
     try:
-        for source_index, source in enumerate(sources):
-            obj, mapping = _create_partition_object(source, source_index, depsgraph, anchor, forward, config)
-            if obj is None:
-                continue
-            objects.append(obj)
-            for key in mappings:
-                mappings[key].append(mapping[key])
-        if not objects:
+        build_started = time.perf_counter()
+        _log(
+            f"observation {observation_index}/{observation_total} {identity}: "
+            "building merged partition"
+        )
+        obj, mapping, stats = _create_partition_object(
+            source_geometry, anchor, forward, config
+        )
+        if obj is None or mapping is None or stats is None:
             raise RuntimeError(f"{identity} selected no geometry")
+        objects.append(obj)
+        owned_materials = stats.pop("owned_materials")
+        removed = stats["removed_images"]
+        _log(
+            f"observation {observation_index}/{observation_total} {identity}: "
+            f"mesh ready in {_seconds(build_started)}; "
+            f"triangles={stats['triangle_count']}, vertices={stats['vertex_count']}, "
+            f"sources={stats['source_count']}, materials={stats['material_count']}, "
+            f"invalid_images_removed={len(removed)}"
+        )
+        if removed:
+            _log(f"{identity}: removed invalid images: {', '.join(removed[:16])}")
         geometry_path = partition_dir / "scene_partition.glb"
+        export_started = time.perf_counter()
+        _log(
+            f"observation {observation_index}/{observation_total} {identity}: "
+            "exporting one merged GLB object"
+        )
         _export_glb(geometry_path, objects, config.include_materials)
-        output_count = sum(len(parts) for parts in mappings["is_core"])
+        _log(
+            f"observation {observation_index}/{observation_total} {identity}: "
+            f"GLB exported in {_seconds(export_started)}; bytes={geometry_path.stat().st_size}"
+        )
+        output_count = len(mapping["is_core"])
         mapping_path = partition_dir / "source_faces.npz"
-        arrays = {key: np.concatenate(parts) for key, parts in mappings.items()}
+        arrays = dict(mapping)
         arrays["output_triangle_index"] = np.arange(output_count, dtype=np.int64)
         np.savez_compressed(mapping_path, **arrays)
         region = ObservationRegion(
@@ -434,9 +678,15 @@ def _export_observation(staging, source_reference, scene_hash, anchor_candidate,
             quality={"floor_component_id": anchor_candidate.component_id, "floor_component_area_m2": anchor_candidate.component_area_m2},
         )
         write_json_atomic(directory / "observation.json", region.to_dict())
+        _log(
+            f"observation {observation_index}/{observation_total} {identity}: complete; "
+            f"core_triangles={region.core_triangle_count}, "
+            f"context_triangles={region.context_triangle_count}"
+        )
         return region
     finally:
         _remove_objects(objects)
+        _remove_materials(owned_materials)
 
 
 def _publish(staging: Path, output: Path, force: bool) -> None:
@@ -468,21 +718,52 @@ def main() -> None:
     staging = output.with_name(f".{output.name}.staging-{uuid.uuid4().hex}")
     staging.mkdir(parents=True)
     try:
+        total_started = time.perf_counter()
+        stage_started = time.perf_counter()
+        _log(f"importing FBX: {source}")
         _import_scene(source, config)
+        _log(f"FBX imported in {_seconds(stage_started)}")
         depsgraph = bpy.context.evaluated_depsgraph_get()
+        stage_started = time.perf_counter()
         sources = _mesh_sources(depsgraph)
-        geometry = _collect_geometry(sources, depsgraph)
-        components = _floor_components(geometry, config)
-        scene_hash = _sha256_file(source)
-        anchors = _sample_anchors(components, geometry, sources, depsgraph, config, scene_hash)
-        source_reference = args.source_relative or str(source)
-        regions = [
-            _export_observation(
-                staging, source_reference, scene_hash, anchor, forward,
-                sources, depsgraph, config,
+        _log(f"caching evaluated geometry for {len(sources)} sources")
+        geometry, source_geometry = _collect_geometry(sources, depsgraph)
+        cache_bytes = sum(
+            array.nbytes
+            for item in source_geometry
+            for array in (
+                (
+                    item.vertices, item.triangles, item.loops, item.polygons,
+                    item.centroids, item.normals, item.areas, item.polygon_smooth,
+                    item.polygon_material,
+                ) + ((item.loop_uv,) if item.loop_uv is not None else ())
             )
-            for anchor, forward in anchors
-        ]
+        )
+        _log(
+            f"geometry cached in {_seconds(stage_started)}; "
+            f"triangles={len(geometry['centroids'])}, cache={cache_bytes / (1024 ** 2):.1f} MiB"
+        )
+        stage_started = time.perf_counter()
+        components = _floor_components(geometry, config)
+        _log(f"found {len(components)} floor components in {_seconds(stage_started)}")
+        stage_started = time.perf_counter()
+        scene_hash = _sha256_file(source)
+        anchors = _sample_anchors(
+            components, geometry, source_geometry, depsgraph, config, scene_hash
+        )
+        _log(
+            f"selected {len(anchors)}/{config.observations_per_scene} anchors "
+            f"in {_seconds(stage_started)}"
+        )
+        source_reference = args.source_relative or str(source)
+        regions = []
+        for index, (anchor, forward) in enumerate(anchors, start=1):
+            regions.append(
+                _export_observation(
+                    staging, source_reference, scene_hash, anchor, forward,
+                    source_geometry, config, index, len(anchors),
+                )
+            )
         payload = {
             "schema_version": 1, "scene_id": _safe_scene_id(source),
             "source_scene": source_reference, "source_sha256": scene_hash,
@@ -497,6 +778,10 @@ def main() -> None:
             "generated_observations": len(regions), "source_triangle_count": len(geometry["centroids"]),
         })
         _publish(staging, output, args.force)
+        _log(
+            f"published {len(regions)} observations to {output} "
+            f"in {_seconds(total_started)}"
+        )
     except Exception:
         if staging.exists():
             shutil.rmtree(staging)
