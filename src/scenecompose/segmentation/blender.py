@@ -16,7 +16,8 @@ def build_prepare_command(
     if stage not in {"geometry", "views", "all"}:
         raise ValueError(f"Unsupported Blender preparation stage: {stage}")
     command = [
-        blender, "--background", "--factory-startup", "--python", str(script.resolve()), "--",
+        blender, "--background", "--factory-startup", "--python-exit-code", "1",
+        "--python", str(script.resolve()), "--",
         "--scene", str(scene.resolve()), "--output", str(output.resolve()),
         "--config", str(config.resolve()), "--stage", stage,
     ]

@@ -118,17 +118,24 @@ def _extract_geometry(neutral: tuple[int, int, int]) -> dict[str, np.ndarray]:
     triangle_corner_rgb: list[np.ndarray] = []
     image_cache: dict[str, np.ndarray] = {}
     vertex_offset = 0
-    instances = sorted(
-        (item for item in depsgraph.object_instances if item.object.type == "MESH"),
-        key=lambda item: (item.object.name.casefold(), tuple(item.persistent_id)),
-    )
-    for instance in instances:
-        source = instance.object
+    instance_records = []
+    for instance in depsgraph.object_instances:
+        evaluated_object = instance.object
+        if evaluated_object.type != "MESH":
+            continue
+        source = evaluated_object.original
+        persistent_id = tuple(int(value) for value in instance.persistent_id)
+        world = instance.matrix_world.copy()
+        instance_records.append(
+            (source.name_full.casefold(), persistent_id, source, world)
+        )
+    instance_records.sort(key=lambda record: (record[0], record[1]))
+
+    for _, _, source, world in instance_records:
         evaluated = source.evaluated_get(depsgraph)
         mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
         try:
             mesh.calc_loop_triangles()
-            world = instance.matrix_world.copy()
             object_id = len(object_names)
             object_names.append(source.name)
             local_vertices = np.asarray([tuple(world @ vertex.co) for vertex in mesh.vertices], dtype=np.float32)
