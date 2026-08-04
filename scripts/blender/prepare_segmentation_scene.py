@@ -18,6 +18,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--stage", choices=("geometry", "views", "all"), default="all")
+    parser.add_argument("--observation", type=Path, default=None)
     parser.add_argument("--validate-only", action="store_true")
     return parser.parse_args(values)
 
@@ -112,14 +113,17 @@ def _extract_geometry(neutral: tuple[int, int, int]) -> dict[str, np.ndarray]:
     triangle_rgb: list[np.ndarray] = []
     triangle_object: list[int] = []
     triangle_polygon: list[int] = []
+    triangle_local_index: list[int] = []
     object_names: list[str] = []
     triangle_corner_rgb: list[np.ndarray] = []
     image_cache: dict[str, np.ndarray] = {}
     vertex_offset = 0
-    for instance in depsgraph.object_instances:
+    instances = sorted(
+        (item for item in depsgraph.object_instances if item.object.type == "MESH"),
+        key=lambda item: (item.object.name.casefold(), tuple(item.persistent_id)),
+    )
+    for instance in instances:
         source = instance.object
-        if source.type != "MESH":
-            continue
         evaluated = source.evaluated_get(depsgraph)
         mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
         try:
@@ -129,7 +133,7 @@ def _extract_geometry(neutral: tuple[int, int, int]) -> dict[str, np.ndarray]:
             object_names.append(source.name)
             local_vertices = np.asarray([tuple(world @ vertex.co) for vertex in mesh.vertices], dtype=np.float32)
             vertices.append(local_vertices)
-            for tri in mesh.loop_triangles:
+            for local_triangle_index, tri in enumerate(mesh.loop_triangles):
                 triangles.append(np.asarray(tri.vertices, dtype=np.int64) + vertex_offset)
                 triangle_rgb.append(_material_rgb(source, tri.material_index, neutral))
                 triangle_corner_rgb.append(
@@ -137,6 +141,7 @@ def _extract_geometry(neutral: tuple[int, int, int]) -> dict[str, np.ndarray]:
                 )
                 triangle_object.append(object_id)
                 triangle_polygon.append(int(tri.polygon_index))
+                triangle_local_index.append(local_triangle_index)
             vertex_offset += len(local_vertices)
         finally:
             evaluated.to_mesh_clear()
@@ -149,6 +154,7 @@ def _extract_geometry(neutral: tuple[int, int, int]) -> dict[str, np.ndarray]:
         "triangle_corner_rgb": np.stack(triangle_corner_rgb),
         "triangle_object": np.asarray(triangle_object, dtype=np.int32),
         "triangle_polygon": np.asarray(triangle_polygon, dtype=np.int32),
+        "triangle_local_index": np.asarray(triangle_local_index, dtype=np.int64),
         "object_names": np.asarray(object_names, dtype=np.str_),
     }
 
@@ -237,7 +243,58 @@ def _camera_candidates(points: np.ndarray, bounds_min: np.ndarray, bounds_max: n
     return candidates[: int(render["max_views"])]
 
 
-def _render_views(output: Path, geometry: dict[str, np.ndarray], samples: dict[str, np.ndarray], config: dict[str, object]) -> None:
+def _camera_position_clear(location: Vector, clearance: float, depsgraph) -> bool:
+    directions = (
+        (1.0, 0.0, 0.0), (-1.0, 0.0, 0.0), (0.0, 1.0, 0.0),
+        (0.0, -1.0, 0.0), (0.0, 0.0, 1.0), (0.0, 0.0, -1.0),
+    )
+    for direction in directions:
+        hit, _, _, _, _, _ = bpy.context.scene.ray_cast(
+            depsgraph, location, Vector(direction), distance=clearance
+        )
+        if hit:
+            return False
+    return True
+
+
+def _observation_camera_candidates(observation: dict[str, object], render: dict[str, object]):
+    eye = np.asarray(observation["anchor_eye"], dtype=np.float64)
+    forward = np.asarray(observation["reference_forward"], dtype=np.float64)
+    right = np.asarray(observation["reference_right"], dtype=np.float64)
+    motion = float(observation["camera_motion_radius_m"])
+    offsets = [(0.0, 0.0)]
+    for fraction in (0.45, 0.85):
+        for angle in (0.0, 90.0, 180.0, 270.0):
+            radians = math.radians(angle)
+            offsets.append((fraction * motion * math.cos(radians), fraction * motion * math.sin(radians)))
+    candidates = []
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    clearance = float(render["camera_min_clearance_m"])
+    for right_offset, forward_offset in offsets:
+        location_array = eye + right * right_offset + forward * forward_offset
+        location = Vector(tuple(location_array))
+        if not _camera_position_clear(location, clearance, depsgraph):
+            continue
+        for pitch in render["observation_pitch_offsets_deg"]:
+            for yaw in render["observation_yaw_offsets_deg"]:
+                yaw_rad = math.radians(float(yaw))
+                pitch_rad = math.radians(float(pitch))
+                horizontal = forward * math.cos(yaw_rad) + right * math.sin(yaw_rad)
+                direction = horizontal * math.cos(pitch_rad)
+                direction[2] = math.sin(pitch_rad)
+                target = location + Vector(tuple(direction))
+                candidates.append((location.copy(), target, {
+                    "anchor_offset": [float(right_offset), float(forward_offset), 0.0],
+                    "yaw_offset_deg": float(yaw), "pitch_offset_deg": float(pitch),
+                }))
+                if len(candidates) >= int(render["observation_camera_count"]):
+                    return candidates
+    if not candidates:
+        raise RuntimeError("No collision-free observation camera positions were found")
+    return candidates
+
+
+def _render_views(output: Path, geometry: dict[str, np.ndarray], samples: dict[str, np.ndarray], config: dict[str, object], observation: dict[str, object] | None = None) -> None:
     render = config["render"]
     scene = bpy.context.scene
     scene.render.engine = str(render["engine"])
@@ -274,7 +331,15 @@ def _render_views(output: Path, geometry: dict[str, np.ndarray], samples: dict[s
     camera_dir = output / "views" / "cameras"
     rgb_dir.mkdir(parents=True, exist_ok=True)
     camera_dir.mkdir(parents=True, exist_ok=True)
-    for index, (location, target) in enumerate(_camera_candidates(samples["points"], bounds_min, bounds_max, render)):
+    if observation is None:
+        candidates = [
+            (location, target, {})
+            for location, target in _camera_candidates(samples["points"], bounds_min, bounds_max, render)
+        ]
+    else:
+        candidates = _observation_camera_candidates(observation, render)
+    view_records = []
+    for index, (location, target, camera_metadata) in enumerate(candidates):
         view_id = f"view_{index:05d}"
         camera.location = location
         camera.matrix_world = Matrix.Translation(location) @ _look_at(location, target)
@@ -288,8 +353,41 @@ def _render_views(output: Path, geometry: dict[str, np.ndarray], samples: dict[s
         intrinsic = [[fx, 0.0, width * 0.5], [0.0, fy, height * 0.5], [0.0, 0.0, 1.0]]
         camera_to_world = np.asarray(camera.matrix_world, dtype=np.float64).tolist()
         world_to_camera = np.linalg.inv(np.asarray(camera.matrix_world, dtype=np.float64)).tolist()
-        _write_json(camera_dir / f"{view_id}.json", {"schema_version": 1, "view_id": view_id, "width": int(width), "height": int(height), "intrinsic": intrinsic, "camera_to_world": camera_to_world, "world_to_camera": world_to_camera, "rgb": f"../rgb/{view_id}.png", "depth_glob": f"../depth/{view_id}_*.exr"})
-    _write_json(output / "views" / "views.json", {"schema_version": 1, "view_count": len(list(camera_dir.glob("*.json"))), "bounds_min": bounds_min.tolist(), "bounds_max": bounds_max.tolist()})
+        record = {"schema_version": 1, "view_id": view_id, "width": int(width), "height": int(height), "intrinsic": intrinsic, "camera_to_world": camera_to_world, "world_to_camera": world_to_camera, "rgb": f"../rgb/{view_id}.png", "depth_glob": f"../depth/{view_id}_*.exr", **camera_metadata}
+        _write_json(camera_dir / f"{view_id}.json", record)
+        view_records.append({"view_id": view_id, **camera_metadata})
+    _write_json(output / "views" / "views.json", {"schema_version": 1, "view_count": len(view_records), "bounds_min": bounds_min.tolist(), "bounds_max": bounds_max.tolist(), "observation_id": observation.get("observation_id") if observation else None, "views": view_records})
+
+
+def _observation_face_mapping(
+    geometry: dict[str, np.ndarray], observation_path: Path, observation: dict[str, object]
+) -> dict[str, np.ndarray]:
+    source_path = (observation_path.parent / str(observation["source_faces"])).resolve()
+    with np.load(source_path, allow_pickle=False) as archive:
+        source = {key: archive[key] for key in archive.files}
+    lookup = {
+        (str(name), int(local)): index
+        for index, (name, local) in enumerate(zip(
+            source["output_object_name"], source["output_triangle_index_within_object"]
+        ))
+    }
+    source_indices = np.full(len(geometry["triangles"]), -1, dtype=np.int64)
+    for face_index, (object_index, local_index) in enumerate(zip(
+        geometry["triangle_object"], geometry["triangle_local_index"]
+    )):
+        name = str(geometry["object_names"][int(object_index)])
+        key = (name, int(local_index))
+        if key not in lookup:
+            raise RuntimeError(f"Cannot map imported partition face {key} to source_faces.npz")
+        source_indices[face_index] = lookup[key]
+    return {
+        "source_face_row": source_indices,
+        "source_object_index": source["source_object_index"][source_indices],
+        "source_instance_index": source["source_instance_index"][source_indices],
+        "source_polygon_index": source["source_polygon_index"][source_indices],
+        "is_core": source["is_core"][source_indices].astype(bool),
+        "is_context": source["is_context"][source_indices].astype(bool),
+    }
 
 
 def _validate(output: Path) -> None:
@@ -311,6 +409,9 @@ def main() -> None:
         _validate(args.output)
         return
     config = json.loads(args.config.read_text(encoding="utf-8"))
+    observation = None
+    if args.observation is not None:
+        observation = json.loads(args.observation.read_text(encoding="utf-8"))
     _import_scene(args.scene, config["geometry"].get("meters_per_blender_unit"))
     geometry_path = args.output / "geometry" / "geometry.npz"
     if args.stage in {"geometry", "all"}:
@@ -319,6 +420,9 @@ def main() -> None:
         _write_npz(geometry_path, **geometry)
         _write_npz(args.output / "geometry" / "mesh_mapping.npz", triangle_ids=samples["triangle_ids"], barycentric=samples["barycentric"], triangle_object=geometry["triangle_object"], triangle_polygon=geometry["triangle_polygon"])
         _write_npz(args.output / "geometry" / "samples.npz", **samples)
+        if observation is not None:
+            mapping = _observation_face_mapping(geometry, args.observation, observation)
+            _write_npz(args.output / "geometry" / "observation_mapping.npz", **mapping)
         _write_point_ply(args.output / "geometry" / "sampled_points.ply", samples)
         _write_json(args.output / "geometry" / "geometry.json", {"schema_version": 1, "vertex_count": len(geometry["vertices"]), "triangle_count": len(geometry["triangles"]), "sample_count": len(samples["points"]), "bounds_min": geometry["vertices"].min(axis=0).tolist(), "bounds_max": geometry["vertices"].max(axis=0).tolist()})
     if args.stage in {"views", "all"}:
@@ -328,7 +432,7 @@ def main() -> None:
             geometry = {key: archive[key] for key in archive.files}
         with np.load(args.output / "geometry" / "samples.npz", allow_pickle=False) as archive:
             samples = {key: archive[key] for key in archive.files}
-        _render_views(args.output, geometry, samples, config)
+        _render_views(args.output, geometry, samples, config, observation)
     _validate(args.output)
 
 

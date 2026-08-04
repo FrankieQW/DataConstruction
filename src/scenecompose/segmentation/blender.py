@@ -11,14 +11,18 @@ def build_prepare_command(
     output: Path,
     config: Path,
     stage: str = "all",
+    observation: Path | None = None,
 ) -> list[str]:
     if stage not in {"geometry", "views", "all"}:
         raise ValueError(f"Unsupported Blender preparation stage: {stage}")
-    return [
+    command = [
         blender, "--background", "--factory-startup", "--python", str(script.resolve()), "--",
         "--scene", str(scene.resolve()), "--output", str(output.resolve()),
         "--config", str(config.resolve()), "--stage", stage,
     ]
+    if observation is not None:
+        command.extend(("--observation", str(observation.resolve())))
+    return command
 
 
 def run_prepare_scene(command: list[str], log_path: Path) -> None:

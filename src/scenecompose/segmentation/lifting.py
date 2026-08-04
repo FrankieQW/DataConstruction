@@ -105,3 +105,37 @@ def lift_all_masks(mask_index: Path, camera_dir: Path, depth_dir: Path, samples_
         if lifted is not None:
             observations.append(lifted)
     return observations
+
+
+def compute_point_visibility(
+    camera_dir: Path,
+    depth_dir: Path,
+    samples_path: Path,
+    config: FusionConfig,
+) -> np.ndarray:
+    from scipy.spatial import cKDTree
+
+    with np.load(samples_path, allow_pickle=False) as archive:
+        points = archive["points"].astype(np.float32)
+    tree = cKDTree(points)
+    counts = np.zeros(len(points), dtype=np.int32)
+    stride = config.visibility_pixel_stride
+    for camera_path in sorted(camera_dir.glob("*.json")):
+        camera = json.loads(camera_path.read_text(encoding="utf-8"))
+        matches = sorted(depth_dir.glob(f"{camera_path.stem}_*.exr"))
+        if len(matches) != 1:
+            raise ValueError(f"Expected one depth image for {camera_path.stem}, found {len(matches)}")
+        depth = read_depth(matches[0])
+        mask = np.zeros(depth.shape, dtype=bool)
+        mask[::stride, ::stride] = True
+        world, _ = unproject_blender_depth(
+            mask, depth, np.asarray(camera["intrinsic"]), np.asarray(camera["camera_to_world"])
+        )
+        if not len(world):
+            continue
+        distances, indices = tree.query(
+            world, k=1, distance_upper_bound=config.lift_radius_m, workers=-1
+        )
+        visible = np.unique(indices[np.isfinite(distances) & (indices < len(points))])
+        counts[visible] += 1
+    return counts

@@ -9,7 +9,15 @@ import shutil
 import subprocess
 import sys
 
-from scenecompose.segmentation.pipeline import STAGES, run_segmentation_batch
+from scenecompose.observation.pipeline import (
+    run_observation_partition,
+    run_observation_partition_batch,
+)
+from scenecompose.segmentation.pipeline import (
+    STAGES,
+    run_observation_segmentation_batch,
+    run_segmentation_batch,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -175,6 +183,34 @@ def _parser() -> argparse.ArgumentParser:
     partition_all.add_argument("--force", action="store_true")
     partition_all.set_defaults(handler=_partition_all)
 
+    observations = subparsers.add_parser(
+        "sample-observations", help="Sample observer-centered partitions from one FBX scene"
+    )
+    observations.add_argument("--scene", type=Path, required=True)
+    observations.add_argument("--output", type=Path, required=True)
+    observations.add_argument(
+        "--config", type=Path,
+        default=PROJECT_ROOT / "configs" / "observation_partition.json",
+    )
+    observations.add_argument("--blender", default=os.environ.get("SCENECOMPOSE_BLENDER", "blender"))
+    observations.add_argument("--source-relative", default=None)
+    observations.add_argument("--force", action="store_true")
+    observations.set_defaults(handler=_sample_observations)
+
+    observations_all = subparsers.add_parser(
+        "sample-observations-all", help="Sample observer-centered partitions for all FBX scenes"
+    )
+    observations_all.add_argument("--scene-root", type=Path, default=PROJECT_ROOT / "data" / "scene")
+    observations_all.add_argument("--output-root", type=Path, default=PROJECT_ROOT / "data" / "work")
+    observations_all.add_argument(
+        "--config", type=Path,
+        default=PROJECT_ROOT / "configs" / "observation_partition.json",
+    )
+    observations_all.add_argument("--blender", default=os.environ.get("SCENECOMPOSE_BLENDER", "blender"))
+    observations_all.add_argument("--workers", type=int, default=1)
+    observations_all.add_argument("--force", action="store_true")
+    observations_all.set_defaults(handler=_sample_observations_all)
+
     segment = subparsers.add_parser(
         "segment-scenes", help="Segment complete scene files under a scene root"
     )
@@ -190,24 +226,66 @@ def _parser() -> argparse.ArgumentParser:
     segment.add_argument("--force-stage", choices=STAGES)
     segment.add_argument("--dry-run", action="store_true")
     segment.set_defaults(handler=_segment_scenes)
+
+    segment_observations = subparsers.add_parser(
+        "segment-observations", help="Segment all observation partitions under a work root"
+    )
+    segment_observations.add_argument("--observation-root", type=Path, default=PROJECT_ROOT / "data" / "work")
+    segment_observations.add_argument(
+        "--config", type=Path, default=PROJECT_ROOT / "configs" / "segmentation.json"
+    )
+    segment_observations.add_argument("--blender", default=os.environ.get("SCENECOMPOSE_BLENDER", "blender"))
+    segment_observations.add_argument("--gpus", default=None, help="Comma-separated physical GPU ids")
+    segment_observations.add_argument("--workers", type=int, default=None)
+    segment_observations.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    segment_observations.add_argument("--force-stage", choices=STAGES)
+    segment_observations.add_argument("--dry-run", action="store_true")
+    segment_observations.set_defaults(handler=_segment_observations)
     return parser
 
 
+def _sample_observations(args: argparse.Namespace) -> int:
+    return run_observation_partition(
+        args.scene.resolve(), args.output.resolve(), args.config.resolve(), args.blender,
+        args.source_relative, args.force,
+    )
+
+
+def _sample_observations_all(args: argparse.Namespace) -> int:
+    return run_observation_partition_batch(
+        args.scene_root.resolve(), args.output_root.resolve(), args.config.resolve(),
+        args.blender, args.workers, args.force,
+    )
+
+
 def _segment_scenes(args: argparse.Namespace) -> int:
-    gpus = None
-    if args.gpus:
-        try:
-            gpus = tuple(int(value.strip()) for value in args.gpus.split(",") if value.strip())
-        except ValueError as error:
-            raise SystemExit("--gpus must be a comma-separated list of integers") from error
-        if not gpus or any(value < 0 for value in gpus):
-            raise SystemExit("--gpus must contain non-negative GPU ids")
+    gpus = _parse_gpus(args.gpus)
     return run_segmentation_batch(
         scene_root=args.scene_root.resolve(), output_root=args.output_root.resolve(),
         config_path=args.config.resolve(), blender=args.blender, gpus=gpus,
         workers=args.workers, resume=args.resume, force_stage=args.force_stage,
         dry_run=args.dry_run,
     )
+
+
+def _segment_observations(args: argparse.Namespace) -> int:
+    return run_observation_segmentation_batch(
+        observation_root=args.observation_root.resolve(), config_path=args.config.resolve(),
+        blender=args.blender, gpus=_parse_gpus(args.gpus), workers=args.workers,
+        resume=args.resume, force_stage=args.force_stage, dry_run=args.dry_run,
+    )
+
+
+def _parse_gpus(value: str | None) -> tuple[int, ...] | None:
+    if not value:
+        return None
+    try:
+        gpus = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as error:
+        raise SystemExit("--gpus must be a comma-separated list of integers") from error
+    if not gpus or any(gpu < 0 for gpu in gpus):
+        raise SystemExit("--gpus must contain non-negative GPU ids")
+    return gpus
 
 
 def main() -> int:

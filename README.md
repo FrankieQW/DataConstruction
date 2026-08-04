@@ -2,13 +2,13 @@
 
 SceneCompose is organized as three large stages:
 
-1. adaptive scene partitioning;
-2. whole-scene semantic/instance segmentation;
+1. observer-centered scene partitioning;
+2. partition semantic/instance segmentation;
 3. object placement, constraint solving, and physical validation.
 
-## Adaptive Scene Partitioning
+## Observer-Centered Scene Partitioning
 
-This repository contains stage 1 and the orchestration code for stage 2. The two stages are independent: semantic segmentation reads complete files directly from `data/scene` and never consumes partition outputs.
+The default pipeline samples a valid standing anchor from floor-like geometry, chooses a reference viewing direction, and exports a radius/angle-bounded local GLB with extra context for camera motion. Occluded geometry is retained. Semantic segmentation consumes these observation partitions, and the final object-composition stage will render the object together with its partition.
 
 ### Requirements
 
@@ -29,9 +29,27 @@ git clone https://github.com/JinLi998/CoSMo3D.git
 git clone https://github.com/NVlabs/Mosaic3D.git
 ```
 
-These repositories are reserved for the later segmentation and composition stages and remain isolated from the core orchestration package. Adaptive partitioning itself does not import them.
+These repositories are reserved for segmentation and composition and remain isolated from the core orchestration package. Observation partitioning itself does not import them.
 
-No model weights are needed for partitioning.
+No model weights are needed for observation partitioning.
+
+### Inspect Objaverse metadata
+
+When `data/obj` contains Objaverse GLBs named as `NNN-NNN/<uid>.glb`, download the matching official annotations without downloading any object files or model weights:
+
+```bash
+bash scripts/run_objaverse_metadata.sh data/obj/Objaverse.md data/obj/metadata
+```
+
+or run the Python script directly:
+
+```bash
+python scripts/download_objaverse_metadata.py \
+  --manifest data/obj/Objaverse.md \
+  --output data/obj/metadata
+```
+
+All official gzip files are cached under `data/obj/metadata/cache`; nothing is written to `~/.objaverse`. Inspect `data/obj/metadata/sample.json` first. The complete filtered indexes are `annotations.json` and `annotations.jsonl`, while `lvis_categories.json` provides the preferred category signal for later composition. See `docs/objaverse-metadata-artifacts.md` for the schema and missing-UID behavior.
 
 ### Install
 
@@ -68,7 +86,40 @@ export SCENECOMPOSE_BLENDER=/opt/blender/blender
 
 On later checkouts or after `pixi.lock` is available, use `pixi install` followed by `pixi shell`; `pixi init` is not repeated. See the official [Pixi `pyproject.toml` guide](https://pixi.prefix.dev/latest/python/pyproject_toml/) for details.
 
-### Partition one scene
+### Sample observations from one scene
+
+```bash
+bash scripts/run_observation_partition.sh \
+  data/scene/example.fbx \
+  data/work/example/observations
+```
+
+Equivalent direct command:
+
+```bash
+scenecompose sample-observations \
+  --scene data/scene/example.fbx \
+  --output data/work/example/observations \
+  --config configs/observation_partition.json \
+  --blender "$SCENECOMPOSE_BLENDER"
+```
+
+For all FBX files below `data/scene`:
+
+```bash
+scenecompose sample-observations-all \
+  --scene-root data/scene \
+  --output-root data/work \
+  --workers 4
+```
+
+`--workers` controls concurrent Blender processes and should be sized from CPU memory. Each observation retains world coordinates and exports `observation.json`, `partition/scene_partition.glb`, and `partition/source_faces.npz`. See `docs/observation-partition-artifacts.md`.
+
+### Legacy adaptive XY partitioning
+
+The commands below are retained for debugging and existing outputs. They are no longer the default input to segmentation or composition.
+
+#### Partition one scene
 
 ```bash
 bash scripts/run_partition.sh \
@@ -86,7 +137,7 @@ scenecompose partition \
   --blender "$SCENECOMPOSE_BLENDER"
 ```
 
-### Partition all scenes
+#### Partition all scenes
 
 ```bash
 scenecompose partition-all \
@@ -105,7 +156,7 @@ bash scripts/run_partition_all.sh data/scene data/work 1 configs/partition.json
 
 `--workers` controls concurrent Blender processes and should be selected from available CPU memory, not GPU count. Each later segmentation process can independently consume a completed Region on one of the eight A100 GPUs.
 
-### Behavior
+#### Behavior
 
 A scene is kept intact only when all of these conditions hold:
 
@@ -121,7 +172,7 @@ See `docs/partition-artifacts.md` for the output contract used by later pipeline
 
 ## Scene Semantic Segmentation
 
-Scene segmentation uses Mosaic3D for global open-vocabulary 3D features, SAM3 for promptable masks over rendered views, and Open3DIS-style geometric lifting and cross-view association. It processes every supported file below `data/scene` independently. Adaptive partitioning is not an input to this stage.
+Scene segmentation uses Mosaic3D for open-vocabulary 3D features, SAM3 for promptable masks over rendered views, and Open3DIS-style geometric lifting and cross-view association. The default command discovers `observation.json` files below `data/work`, renders anchor-relative camera views, and writes results inside each observation. The older `segment-scenes` command remains available for whole-scene debugging.
 
 ### Additional environment requirements
 
@@ -162,12 +213,11 @@ The ReCap-CLIP text encoder named by `mosaic3d.text_model_id` must already exist
 
 ### Run
 
-First inspect discovery, paths, checkpoints, and GPU assignment without inference:
+First inspect observation discovery, paths, checkpoints, and GPU assignment without inference:
 
 ```bash
-scenecompose segment-scenes \
-  --scene-root data/scene \
-  --output-root data/work \
+scenecompose segment-observations \
+  --observation-root data/work \
   --config configs/segmentation.json \
   --gpus 0,1,2,3,4,5,6,7 \
   --workers 8 \
@@ -177,9 +227,9 @@ scenecompose segment-scenes \
 Run the complete pipeline with the same command after removing `--dry-run`, or use:
 
 ```bash
-bash scripts/run_segmentation.sh data/scene data/work 0,1,2,3,4,5,6,7 8
+bash scripts/run_observation_segmentation.sh data/work 0,1,2,3,4,5,6,7 8
 ```
 
 `--resume` is enabled by default. Use `--force-stage sam3`, for example, to invalidate SAM3 and all downstream artifacts while retaining geometry, views, and Mosaic3D results. Supported stage names are `geometry`, `views`, `mosaic3d`, `sam3`, `fusion`, and `export`.
 
-Each scene writes to `data/work/<scene-id>/segmentation`. Important results are `fusion/point_labels.npz`, `fusion/face_labels.npz`, `fusion/instances.json`, `visualization/semantic.ply`, and `visualization/instances.ply`. See `docs/segmentation-artifacts.md` for schemas and coordinate conventions.
+Each observation writes to `<observation-directory>/segmentation`. `point_labels.npz` and `face_labels.npz` include visibility counts; face labels also include `is_core`, so composition can reject context-only or unobserved support candidates. Important results are `fusion/point_labels.npz`, `fusion/face_labels.npz`, `fusion/instances.json`, `visualization/semantic.ply`, and `visualization/instances.ply`. See `docs/segmentation-artifacts.md` for schemas and coordinate conventions.

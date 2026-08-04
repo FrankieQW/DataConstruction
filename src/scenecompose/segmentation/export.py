@@ -51,6 +51,8 @@ def export_results(point_labels_path: Path, instances: list[FusedInstance], conf
         points = archive["points"]
         semantic = archive["semantic_ids"]
         instance_ids = archive["instance_ids"]
+        visibility = archive["visibility_count"] if "visibility_count" in archive else np.zeros(len(points), dtype=np.int32)
+        is_core = archive["is_core"] if "is_core" in archive else np.ones(len(points), dtype=bool)
     label_names = {item.id: item.name for item in config.vocabulary}
     records = []
     for item in instances:
@@ -60,6 +62,8 @@ def export_results(point_labels_path: Path, instances: list[FusedInstance], conf
         centered = selected - center
         _, _, axes = np.linalg.svd(centered, full_matrices=False)
         local = centered @ axes.T
+        selected_visibility = visibility[item.point_indices]
+        selected_core = is_core[item.point_indices]
         records.append({
             "instance_id": item.instance_id, "class_id": item.class_id,
             "label": label_names[item.class_id], "confidence": item.confidence,
@@ -67,6 +71,9 @@ def export_results(point_labels_path: Path, instances: list[FusedInstance], conf
             "centroid": center.tolist(), "aabb": {"minimum": minimum.tolist(), "maximum": maximum.tolist()},
             "obb": {"center": center.tolist(), "axes": axes.tolist(), "minimum": local.min(axis=0).tolist(), "maximum": local.max(axis=0).tolist()},
             "view_ids": list(item.view_ids),
+            "visible_point_count": int(np.count_nonzero(selected_visibility)),
+            "visible_point_ratio": float(np.count_nonzero(selected_visibility) / len(selected)),
+            "core_point_ratio": float(np.count_nonzero(selected_core) / len(selected)),
         })
     instance_path = output_root / "fusion" / "instances.json"
     save_json_atomic(instance_path, {"schema_version": 1, "instances": records})

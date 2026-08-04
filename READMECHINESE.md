@@ -2,26 +2,22 @@
 
 [English README](README.md)
 
-SceneCompose 整体分为三个主要阶段：
+SceneCompose 按 Inline Execution 组织为三个大步骤：
 
-1. Scene 自适应切分；
-2. 对完整 Scene 进行语义/实例分割；
-3. Object 放置、约束求解和物理验证。
+1. 基于观察锚点的 Scene 局部切分；
+2. 对局部 Scene 进行语义/实例分割；
+3. Object 放置、约束求解、物理验证和组合结果渲染。
 
-## Scene 自适应切分
+当前实现前两个步骤，并为第三步输出稳定接口。Object 与 partition scene 的组合及最终渲染将在后续实现。
 
-当前仓库包含第一阶段以及第二阶段的编排代码。两个阶段相互独立：语义分割直接读取 `data/scene` 中的完整文件，不读取任何自适应切分结果。
-
-### 环境要求
+## 前置条件
 
 - Linux
 - Python 3.10 或更高版本
-- Blender 4.5 LTS，可通过 `blender` 命令调用，或由 `SCENECOMPOSE_BLENDER` 环境变量指定
-- SceneCompose Python 环境需要安装 NumPy；Blender 内置的 Python 也必须提供 NumPy
+- Blender 4.5 LTS，可通过 `blender` 调用，或由 `SCENECOMPOSE_BLENDER` 指定
+- SceneCompose 环境和 Blender 内置 Python 均需提供 NumPy
 
-#### 第三方源码仓库
-
-完整 pipeline 要求以下仓库直接位于 SceneCompose 项目根目录。请在项目根目录执行这些命令，确保生成的目录名与配置路径一致：
+以下源码仓库需直接位于 SceneCompose 项目根目录：
 
 ```bash
 git clone https://github.com/NVlabs/WarpConvNet.git
@@ -31,46 +27,115 @@ git clone https://github.com/JinLi998/CoSMo3D.git
 git clone https://github.com/NVlabs/Mosaic3D.git
 ```
 
-这些仓库供后续 Scene 语义/实例分割与组合阶段使用，并与核心编排包保持隔离。自适应切分阶段本身不会导入这些仓库。
+观察切分本身不依赖模型权重。SceneCompose 不会自动下载权重。
 
-Scene 切分阶段不需要任何模型权重。
+### 查看 Objaverse metadata
 
-### 安装
-
-可以选择 Mamba 或 Pixi 中的任意一种方式。无论使用哪种方式，Blender 都独立于 Python 环境管理。
-
-#### 方式一：使用 Mamba
-
-创建并激活命名环境，然后以 editable 模式安装 SceneCompose：
+当 `data/obj` 中的 Objaverse GLB 使用 `NNN-NNN/<uid>.glb` 结构时，可根据文件清单下载对应的官方 metadata。该命令不会下载或修改 GLB，也不会下载模型权重：
 
 ```bash
-mamba create -n scenecompose -c conda-forge python=3.12 pip numpy
+bash scripts/run_objaverse_metadata.sh data/obj/Objaverse.md data/obj/metadata
+```
+
+也可以直接运行：
+
+```bash
+python scripts/download_objaverse_metadata.py \
+  --manifest data/obj/Objaverse.md \
+  --output data/obj/metadata
+```
+
+所有官方 gzip 文件都缓存在 `data/obj/metadata/cache`，不会写入 `~/.objaverse`。建议先查看 `data/obj/metadata/sample.json`；完整结果是 `annotations.json` 和 `annotations.jsonl`，`lvis_categories.json` 提供后续组合阶段优先使用的类别信号。字段定义、断点续传和缺失 UID 行为见 [Objaverse metadata 产物说明](docs/objaverse-metadata-artifacts.md)。
+
+## 安装
+
+Blender 独立于 Python 环境管理。可选择 Mamba 或 Pixi。
+
+### 方法一：Mamba
+
+```bash
+mamba create -n scenecompose -c conda-forge python=3.10 pip numpy
 mamba activate scenecompose
 python -m pip install -e .
 export SCENECOMPOSE_BLENDER=/opt/blender/blender
 ```
 
-Shell 初始化和环境管理方法参见 [Mamba 官方用户指南](https://mamba.readthedocs.io/en/stable/user_guide/mamba.html)。
+语义分割还需在同一环境安装 Mosaic3D 与 SAM3 依赖：
 
-#### 方式二：使用 Pixi
+```bash
+python -m pip install -r Mosaic3D/requirements.txt
+python -m pip install -e sam3
+python -m pip install -e .
+```
 
-当前仓库已经包含 `pyproject.toml`。首次配置时，在仓库根目录运行一次 `pixi init`；Pixi 会加入 workspace 配置，并将当前 Python 项目注册为 editable 依赖。随后安装环境并进入 Pixi Shell：
+### 方法二：Pixi
 
 ```bash
 pixi init
+pixi add "python=3.10.*"
 pixi install
-pixi shell
-```
-
-进入 Pixi Shell 后设置 Blender 路径：
-
-```bash
+pixi run python -m pip install -r Mosaic3D/requirements.txt
+pixi run python -m pip install -e sam3
+pixi run python -m pip install -e .
 export SCENECOMPOSE_BLENDER=/opt/blender/blender
 ```
 
-后续重新拉取项目，或者仓库中已经存在 `pixi.lock` 时，只需运行 `pixi install` 和 `pixi shell`，不需要重复执行 `pixi init`。详细说明参见 Pixi 官方的 [`pyproject.toml` 指南](https://pixi.prefix.dev/latest/python/pyproject_toml/)。
+已有 `pixi.lock` 后只需执行 `pixi install`，无需再次执行 `pixi init`。安装 CUDA 依赖前应核对 `Mosaic3D/requirements.txt` 与服务器驱动是否匹配。
 
-### 切分单个 Scene
+## 自适应切分
+
+### 默认方案：基于观察锚点的局部切分
+
+程序从朝上的连续大面积几何中寻找候选地面，检查观察点附近的地面连续性、头部净空和身体净空，然后选择参考观察方向。输出范围由半径、水平视角、垂直范围以及相机移动 Context 共同确定。
+
+切分不会按遮挡删除几何。墙后几何可以保留在 partition 中；后续分割视图的深度图负责统计真实可见性，最终 Object 放置还需针对最终相机执行 BVH 射线检查。
+
+单个 Scene：
+
+```bash
+bash scripts/run_observation_partition.sh \
+  data/scene/example.fbx \
+  data/work/example/observations
+```
+
+等价命令：
+
+```bash
+scenecompose sample-observations \
+  --scene data/scene/example.fbx \
+  --output data/work/example/observations \
+  --config configs/observation_partition.json \
+  --blender "$SCENECOMPOSE_BLENDER"
+```
+
+批量处理 `data/scene` 下所有 FBX：
+
+```bash
+scenecompose sample-observations-all \
+  --scene-root data/scene \
+  --output-root data/work \
+  --config configs/observation_partition.json \
+  --workers 4
+```
+
+`--workers` 表示并发 Blender 进程数，应按 CPU 内存设置，而不是按 GPU 数量设置。
+
+每个 observation 的主要产物为：
+
+```text
+data/work/<scene-id>/observations/observation_<hash>/
+|-- observation.json
+|-- partition/
+|   |-- scene_partition.glb
+|   `-- source_faces.npz
+`-- segmentation/
+```
+
+几何保持原 Scene 世界坐标。`source_faces.npz` 保存输出三角面到原始对象、实例和 polygon 的映射，以及 `is_core/is_context`。详细契约见 [观察切分产物说明](docs/observation-partition-artifacts.md)。
+
+### Legacy：XY 自适应切分
+
+旧的 `partition` 和 `partition-all` 命令继续保留，用于调试和兼容已有结果，但不再作为默认分割和组合入口。
 
 ```bash
 bash scripts/run_partition.sh \
@@ -78,141 +143,55 @@ bash scripts/run_partition.sh \
   data/work/EmeraldSquare_Day/partition
 ```
 
-对应的直接调用命令如下：
-
-```bash
-scenecompose partition \
-  --scene data/scene/EmeraldSquare_v4_1/EmeraldSquare_Day.fbx \
-  --output data/work/EmeraldSquare_Day/partition \
-  --config configs/partition.json \
-  --blender "$SCENECOMPOSE_BLENDER"
-```
-
-### 批量切分全部 Scene
-
 ```bash
 scenecompose partition-all \
   --scene-root data/scene \
   --output-root data/work \
   --config configs/partition.json \
-  --blender "$SCENECOMPOSE_BLENDER" \
   --workers 1
 ```
 
-也可以使用封装脚本：
-
-```bash
-bash scripts/run_partition_all.sh data/scene data/work 1 configs/partition.json
-```
-
-`--workers` 控制同时运行的 Blender 进程数量，应根据服务器可用 CPU 内存设置，而不是根据 GPU 数量设置。完成切分后，后续语义分割阶段可以将不同 Region 独立分配到八张 A100 GPU 上处理。
-
-### 切分行为
-
-只有同时满足以下全部条件时，Scene 才会保持完整而不进行切分：
-
-- evaluated mesh 的三角形数量不超过 `max_triangles_per_region`；
-- 估算采样点数量不超过 `max_estimated_points_per_region`；
-- XY 平面上的最长边不超过 `max_xy_extent_m`。
-
-满足这些条件的 Scene 会成为名为 `region_full` 的 identity Region。该 Region 直接引用原始 FBX，不会复制 Scene 几何。
-
-较大的 Scene 会按照确定性的空间中位数递归切分。各 Region 的 Core 区域在面积上互不重叠，Context 区域则会在 Core 外增加可配置的 Halo，用于提供边界上下文。所有 Region 都保留 Scene 的完整 Z 轴范围，不会沿高度方向切开地面、桌面、墙体等空间关系。
-
-切分归属由三角形在世界坐标中的 XY 质心决定。跨越 Region 边界的三角形会保持完整，不进行几何裁断，从而保留原始拓扑、UV 和材质关系。
-
-### 中间结果格式
-
-默认中间格式是 `.blend`。这种格式可以保留材质并继续引用外部纹理，避免在每个 Region 中重复嵌入大型纹理。
-
-只有确实需要自包含交换文件时，才建议将配置中的 `export_format` 设置为 `glb`。GLB 可能在多个 Region 中重复写入纹理数据，显著增加存储占用。
-
-切分输出的主要文件包括：
-
-```text
-<partition-output>/
-|-- regions.json
-|-- summary.json
-`-- regions/
-    |-- region_full/
-    |   `-- manifest.json
-    `-- region_<content-hash>/
-        |-- manifest.json
-        |-- source_faces.npz
-        `-- scene_region.blend
-```
-
-其中：
-
-- `regions.json` 是后续语义分割和组合阶段的主要输入契约；
-- `summary.json` 记录原始 Scene、实例化几何、规模和切分统计；
-- `scene_region.blend` 保存一个自适应切分 Region 的 Core 与 Halo 几何；
-- `source_faces.npz` 保存导出三角形到原始 Scene 对象、实例和 polygon 的映射；
-- `manifest.json` 记录 Region 边界、所有权、输出对象顺序和相关文件路径。
-
-更完整的中间结果定义参见 [自适应切分产物说明](docs/partition-artifacts.md)。
-
 ## Scene 语义分割
 
-Scene 语义分割使用 Mosaic3D 提取全局开放词汇 3D 特征，使用 SAM3 分割渲染视图，再采用 Open3DIS 风格的几何提升和跨视角关联生成 3D 实例。程序会独立处理 `data/scene` 下的每个受支持文件。自适应切分不是该阶段的输入。
+分割采用 Mosaic3D 开放词汇 3D 特征、SAM3 多视图提示分割，以及 Open3DIS 风格的 2D 到 3D 几何提升和跨视图关联。默认入口递归发现 `data/work` 下的 `observation.json`，一个 observation 对应一个 GPU 工作项。
 
-### 额外环境要求
-
-推理环境需要同时包含 Mosaic3D、SAM3 和 SceneCompose 的依赖。Mosaic3D 当前在 requirements 中固定了 PyTorch 2.2.2，应围绕这一版本配置服务器 CUDA 环境，再将 SAM3 安装到同一环境。SceneCompose 不会自动安装或下载模型权重。
-
-使用 Mamba 时，创建独立的 Python 3.10 推理环境：
-
-```bash
-mamba create -n scenecompose-seg -c conda-forge python=3.10 pip
-mamba activate scenecompose-seg
-python -m pip install -r Mosaic3D/requirements.txt
-python -m pip install -e sam3
-python -m pip install -e .
-```
-
-使用 Pixi 时，先固定 Python 3.10 并安装 SceneCompose 锁定依赖，再把两个本地模型仓库安装进 Pixi 环境：
-
-```bash
-pixi add "python=3.10.*"
-pixi install
-pixi run python -m pip install -r Mosaic3D/requirements.txt
-pixi run python -m pip install -e sam3
-pixi run python -m pip install -e .
-```
-
-安装前需要检查 `Mosaic3D/requirements.txt` 中的 CUDA wheel 是否与服务器驱动匹配。以上命令不下载 checkpoint。
-
-### 权重配置
-
-将权重放到本地后，修改 `configs/segmentation.json`。默认路径为：
+权重路径由 `configs/segmentation.json` 配置，默认是：
 
 ```text
 weights/mosaic3d.ckpt
 weights/sam3.pt
 ```
 
-`mosaic3d.text_model_id` 指定的 ReCap-CLIP 文本编码器必须已经存在于本地 Hugging Face cache。推理会强制使用离线模式；缺失时直接报错，不会自动下载。
+ReCap-CLIP 文本编码器也必须已存在于本地 Hugging Face 缓存。推理使用离线模式，不会自动下载缺失文件。
 
-### 运行
-
-首先只检查 Scene 发现、路径、checkpoint 和 GPU 分配，不执行推理：
+先做只读预检和任务分配检查：
 
 ```bash
-scenecompose segment-scenes \
-  --scene-root data/scene \
-  --output-root data/work \
+scenecompose segment-observations \
+  --observation-root data/work \
   --config configs/segmentation.json \
   --gpus 0,1,2,3,4,5,6,7 \
   --workers 8 \
   --dry-run
 ```
 
-检查通过后移除 `--dry-run` 即可运行完整 pipeline，也可以使用：
+正式运行时移除 `--dry-run`，或使用：
 
 ```bash
-bash scripts/run_segmentation.sh data/scene data/work 0,1,2,3,4,5,6,7 8
+bash scripts/run_observation_segmentation.sh data/work 0,1,2,3,4,5,6,7 8
 ```
 
-默认启用 `--resume`。例如 `--force-stage sam3` 会使 SAM3 及其后续结果失效并重新计算，同时保留几何、视图和 Mosaic3D 结果。有效阶段名为 `geometry`、`views`、`mosaic3d`、`sam3`、`fusion` 和 `export`。
+默认启用 `--resume`。可用 `--force-stage sam3` 使 SAM3 及后续阶段失效并重算。有效阶段名为 `geometry`、`views`、`mosaic3d`、`sam3`、`fusion` 和 `export`。
 
-每个 Scene 输出到 `data/work/<scene-id>/segmentation`。主要结果包括 `fusion/point_labels.npz`、`fusion/face_labels.npz`、`fusion/instances.json`、`visualization/semantic.ply` 和 `visualization/instances.ply`。字段和坐标约定参见 `docs/segmentation-artifacts.md`。
+每个 observation 的结果写入自身 `segmentation/`。关键文件包括：
+
+- `fusion/point_labels.npz`：点语义、实例、`visibility_count`、`is_observed` 和 `is_core`；
+- `fusion/face_labels.npz`：面语义、实例、`visibility_count`、`is_observed` 和 `is_core`；
+- `fusion/instances.json`：实例类别、置信度、包围盒、视图和可见点比例；
+- `visualization/semantic.ply` 与 `visualization/instances.ply`：人工检查用点云。
+
+全 Scene 调试入口 `segment-scenes` 仍然保留，但不读取 observation 锚点，也不作为默认组合流程。
+
+## 后续 Scene 与 Object 组合接口
+
+组合阶段将读取 observation 的锚点坐标系、相机移动域、partition GLB、原 Scene 面映射、语义/实例标签、可见性和 Core/Context 标记。承载面候选默认要求 `is_core == true` 且满足最小可见视图数；选定最终相机后，还必须执行 BVH 可见性、碰撞、稳定性和边界检查，再渲染 Object 与 partition scene 的组合结果。

@@ -61,6 +61,10 @@ class RenderConfig:
     target_surface_coverage: float = 0.95
     min_point_observations: int = 2
     max_views: int = 256
+    observation_camera_count: int = 24
+    observation_yaw_offsets_deg: tuple[float, ...] = (-35.0, -17.5, 0.0, 17.5, 35.0)
+    observation_pitch_offsets_deg: tuple[float, ...] = (-12.0, 0.0, 12.0)
+    camera_min_clearance_m: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -103,6 +107,7 @@ class FusionConfig:
     visibility_weight: float = 0.10
     face_semantic_vote: float = 0.45
     face_instance_vote: float = 0.55
+    visibility_pixel_stride: int = 2
 
 
 @dataclass(frozen=True)
@@ -130,7 +135,13 @@ class SegmentationConfig:
         config = cls(
             vocabulary=tuple(VocabularyClass.from_dict(item) for item in raw["vocabulary"]),
             geometry=_section(GeometryConfig, raw.get("geometry", {}), "geometry"),
-            render=_section(RenderConfig, raw.get("render", {}), "render", tuple_keys={"azimuths_deg", "elevations_deg"}),
+            render=_section(
+                RenderConfig, raw.get("render", {}), "render",
+                tuple_keys={
+                    "azimuths_deg", "elevations_deg", "observation_yaw_offsets_deg",
+                    "observation_pitch_offsets_deg",
+                },
+            ),
             mosaic3d=_section(MosaicConfig, raw.get("mosaic3d", {}), "mosaic3d"),
             sam3=_section(Sam3Config, raw.get("sam3", {}), "sam3"),
             fusion=_section(FusionConfig, raw.get("fusion", {}), "fusion"),
@@ -156,8 +167,14 @@ class SegmentationConfig:
             raise ValueError("geometry.meters_per_blender_unit must be positive when set")
         if not self.runtime.gpus or any(gpu < 0 for gpu in self.runtime.gpus):
             raise ValueError("runtime.gpus must contain non-negative GPU ids")
-        if self.render.width <= 0 or self.render.height <= 0 or self.render.max_views <= 0:
+        if (
+            self.render.width <= 0 or self.render.height <= 0 or self.render.max_views <= 0
+            or self.render.observation_camera_count <= 0
+            or self.render.camera_min_clearance_m <= 0
+        ):
             raise ValueError("render dimensions and max_views must be positive")
+        if not self.render.observation_yaw_offsets_deg or not self.render.observation_pitch_offsets_deg:
+            raise ValueError("observation camera yaw/pitch offsets must not be empty")
         if not 1.0 < self.render.horizontal_fov_deg < 179.0:
             raise ValueError("render.horizontal_fov_deg must be between 1 and 179 degrees")
         for name, value in {
@@ -179,6 +196,8 @@ class SegmentationConfig:
         )
         if abs(weights - 1.0) > 1e-6:
             raise ValueError("fusion evidence weights must sum to 1")
+        if self.fusion.visibility_pixel_stride <= 0:
+            raise ValueError("fusion.visibility_pixel_stride must be positive")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

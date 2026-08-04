@@ -50,8 +50,11 @@ Camera JSON stores row-major 4x4 `camera_to_world` and `world_to_camera` matrice
 - `instance_ids`: int32 `[N]`; `-1` means no thing instance.
 - `triangle_ids`: int64 `[N]`.
 - `unknown`: bool `[N]`.
+- `visibility_count`: int32 `[N]`, number of depth views observing the point.
+- `is_observed`: bool `[N]`.
+- `is_core`: bool `[N]`; always true for legacy whole-scene runs.
 
-`fusion/face_labels.npz` contains `semantic_ids`, `semantic_confidence`, and `instance_ids` for the evaluated triangles. `fusion/fused_instances.npz` is the restart artifact used by the export stage. `fusion/instances.json` contains compact point/face index runs, class and confidence, observing views, centroid, AABB, and PCA OBB.
+`fusion/face_labels.npz` contains `semantic_ids`, `semantic_confidence`, `instance_ids`, `visibility_count`, `is_observed`, and `is_core` for the evaluated triangles. `fusion/fused_instances.npz` is the restart artifact used by the export stage. `fusion/instances.json` contains compact point/face index runs, class and confidence, observing views, visible/core point ratios, centroid, AABB, and PCA OBB.
 
 ## Restart behavior
 

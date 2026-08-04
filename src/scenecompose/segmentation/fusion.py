@@ -20,12 +20,35 @@ class FusedInstance:
     view_ids: tuple[str, ...]
 
 
-def fuse_predictions(samples_path: Path, geometry_path: Path, scores_path: Path, instances: list[AssociatedInstance], config: SegmentationConfig, output_dir: Path) -> tuple[list[Path], list[FusedInstance]]:
+def fuse_predictions(
+    samples_path: Path,
+    geometry_path: Path,
+    scores_path: Path,
+    instances: list[AssociatedInstance],
+    config: SegmentationConfig,
+    output_dir: Path,
+    observation_mapping: Path | None = None,
+    camera_dir: Path | None = None,
+    depth_dir: Path | None = None,
+) -> tuple[list[Path], list[FusedInstance]]:
     with np.load(samples_path, allow_pickle=False) as archive:
         points = archive["points"]
         triangle_ids = archive["triangle_ids"].astype(np.int64)
     with np.load(geometry_path, allow_pickle=False) as archive:
         face_count = len(archive["triangles"])
+    point_visibility = np.zeros(len(points), dtype=np.int32)
+    if camera_dir is not None and depth_dir is not None:
+        from .lifting import compute_point_visibility
+        point_visibility = compute_point_visibility(camera_dir, depth_dir, samples_path, config.fusion)
+    face_visibility = np.zeros(face_count, dtype=np.int32)
+    np.maximum.at(face_visibility, triangle_ids, point_visibility)
+    face_is_core = np.ones(face_count, dtype=bool)
+    if observation_mapping is not None:
+        with np.load(observation_mapping, allow_pickle=False) as archive:
+            face_is_core = archive["is_core"].astype(bool)
+        if len(face_is_core) != face_count:
+            raise ValueError("Observation face mapping does not match segmentation geometry")
+    point_is_core = face_is_core[triangle_ids]
     with np.load(scores_path, allow_pickle=False) as archive:
         top_classes = archive["class_ids"].astype(np.int32)
         top_confidence = archive["confidence"].astype(np.float32)
@@ -85,8 +108,18 @@ def fuse_predictions(samples_path: Path, geometry_path: Path, scores_path: Path,
     point_path = output_dir / "point_labels.npz"
     face_path = output_dir / "face_labels.npz"
     instance_path = output_dir / "fused_instances.npz"
-    save_npz_atomic(point_path, points=points, semantic_ids=semantic, semantic_confidence=semantic_confidence, instance_ids=instance_ids, triangle_ids=triangle_ids, unknown=unknown)
-    save_npz_atomic(face_path, semantic_ids=face_semantic, semantic_confidence=face_confidence, instance_ids=face_instances)
+    save_npz_atomic(
+        point_path, points=points, semantic_ids=semantic,
+        semantic_confidence=semantic_confidence, instance_ids=instance_ids,
+        triangle_ids=triangle_ids, unknown=unknown,
+        visibility_count=point_visibility, is_observed=point_visibility > 0,
+        is_core=point_is_core,
+    )
+    save_npz_atomic(
+        face_path, semantic_ids=face_semantic, semantic_confidence=face_confidence,
+        instance_ids=face_instances, visibility_count=face_visibility,
+        is_observed=face_visibility > 0, is_core=face_is_core,
+    )
     _save_instances(instance_path, accepted)
     return [point_path, face_path, instance_path], accepted
 
