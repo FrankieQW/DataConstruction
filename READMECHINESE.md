@@ -6,9 +6,9 @@ SceneCompose 按 Inline Execution 组织为三个大步骤：
 
 1. 基于观察锚点的 Scene 局部切分；
 2. 对局部 Scene 进行语义/实例分割；
-3. Object 放置、约束求解、物理验证和组合结果渲染。
+3. Object 目录构建、放置、约束求解、物理验证和 GLB 导出。
 
-当前实现前两个步骤，并为第三步输出稳定接口。Object 与 partition scene 的组合及最终渲染将在后续实现。
+当前已实现三个步骤。第三步输出 Object 与 partition scene 的组合 GLB 和参考相机参数，但不执行图片渲染。
 
 ## 前置条件
 
@@ -192,6 +192,62 @@ bash scripts/run_observation_segmentation.sh data/work 0,1,2,3,4,5,6,7 8
 
 全 Scene 调试入口 `segment-scenes` 仍然保留，但不读取 observation 锚点，也不作为默认组合流程。
 
-## 后续 Scene 与 Object 组合接口
+## Scene 与 Object 组合
 
-组合阶段将读取 observation 的锚点坐标系、相机移动域、partition GLB、原 Scene 面映射、语义/实例标签、可见性和 Core/Context 标记。承载面候选默认要求 `is_core == true` 且满足最小可见视图数；选定最终相机后，还必须执行 BVH 可见性、碰撞、稳定性和边界检查，再渲染 Object 与 partition scene 的组合结果。
+组合分为两个独立命令。`build-object-catalog` 将本地 GLB 与 `annotations.json` 按 UID 关联，先执行确定性的 metadata/LVIS 规则，可选使用单次加载的本地 Qwen 模型处理无法确定的对象，最后由 Blender 生成几何档案。`compose-observations` 从语义面标签中提取朝上、已观察且属于 Core 的支撑面，再执行尺寸归一化、边界、碰撞和锚点可见性检查。每个 observation 最多放置一个 Object。
+
+### 本地部署 Qwen（不使用 API）
+
+`configs/composition.json` 默认设置 `llm.enabled: false`，此时只接受高置信规则命中的对象。启用本地 Qwen 前，需要先安装与服务器 CUDA 驱动匹配的 PyTorch，再安装 Transformers 依赖。
+
+Mamba 环境：
+
+```bash
+mamba activate scenecompose
+python -m pip install "transformers>=4.51" accelerate safetensors
+```
+
+Pixi 环境：
+
+```bash
+pixi run python -m pip install "transformers>=4.51" accelerate safetensors
+```
+
+将 Transformers 格式的指令模型放在项目目录内，例如 `weights/Qwen3-8B`，然后修改配置：
+
+```json
+"llm": {
+  "enabled": true,
+  "backend": "transformers",
+  "model_path": "weights/Qwen3-8B",
+  "device": "cuda:0",
+  "dtype": "bfloat16",
+  "local_files_only": true
+}
+```
+
+模型只在对象目录构建阶段加载一次，代码要求非思考模式输出，并将结果限制在配置中的标准类别内。分类缓存写入 `data/work/object_catalog/llm_classification_cache.json`，不会启动 HTTP 服务，也不会调用外部 API。用法依据 [Qwen 官方 Transformers 指南](https://qwen.readthedocs.io/en/stable/inference/transformers.html)。
+
+### 构建 Object 目录
+
+确保 Objaverse GLB 已位于 `data/obj` 后执行：
+
+```bash
+bash scripts/run_object_catalog.sh \
+  data/obj \
+  data/obj/metadata/annotations.json \
+  data/work/object_catalog
+```
+
+可先给 `scenecompose build-object-catalog` 增加 `--dry-run`，只检查发现结果和规则分类，不运行 Blender 或 LLM。正式结果为 `data/work/object_catalog/catalog.json`，几何档案和 LLM 分类均支持断点复用。
+
+### 执行组合
+
+```bash
+bash scripts/run_composition.sh \
+  data/work \
+  data/work/object_catalog/catalog.json \
+  data/composed
+```
+
+成功目录包含 `combined_scene.glb`、`placement.json`、`camera.json` 和 `support_patches.json`。`camera.json` 保存从 observation 锚点朝向 Object 的参考相机，但本阶段不渲染图片。失败任务仍会保留 `placement.json`，其中逐项记录候选对象、支撑面和失败原因。

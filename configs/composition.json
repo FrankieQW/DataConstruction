@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "catalog": {
+    "seed": 20260804,
+    "blender_batch_size": 16,
+    "workers": 2,
+    "minimum_faces": 20,
+    "maximum_faces": 2000000,
+    "maximum_components": 64,
+    "minimum_primary_component_ratio": 0.65,
+    "allowed_licenses": ["cc0", "by", "by-sa", "by-nc", "by-nc-sa"],
+    "reject_metadata_categories": ["architecture", "characters-creatures", "cultural-heritage-history", "art-abstract", "weapons-military", "cars-vehicles", "animals-pets", "people"],
+    "class_rules": [
+      {"canonical_class": "cup", "placement_type": "surface", "support_classes": ["table", "desk", "counter", "shelf"], "terms": ["cup", "mug", "coffee cup", "teacup"], "target_dimension": "height", "target_min_m": 0.08, "target_max_m": 0.16},
+      {"canonical_class": "bottle", "placement_type": "surface", "support_classes": ["table", "desk", "counter", "shelf"], "terms": ["bottle", "wine bottle", "water bottle"], "target_dimension": "height", "target_min_m": 0.15, "target_max_m": 0.35},
+      {"canonical_class": "book", "placement_type": "surface", "support_classes": ["table", "desk", "counter", "shelf"], "terms": ["book", "bible", "notebook"], "target_dimension": "longest", "target_min_m": 0.15, "target_max_m": 0.35},
+      {"canonical_class": "bowl", "placement_type": "surface", "support_classes": ["table", "counter", "shelf"], "terms": ["bowl", "dish"], "target_dimension": "longest", "target_min_m": 0.10, "target_max_m": 0.30},
+      {"canonical_class": "plate", "placement_type": "surface", "support_classes": ["table", "counter", "shelf"], "terms": ["plate", "saucer"], "target_dimension": "longest", "target_min_m": 0.15, "target_max_m": 0.35},
+      {"canonical_class": "vase", "placement_type": "surface", "support_classes": ["table", "desk", "counter", "shelf"], "terms": ["vase", "flower vase"], "target_dimension": "height", "target_min_m": 0.12, "target_max_m": 0.45},
+      {"canonical_class": "plant", "placement_type": "surface", "support_classes": ["table", "desk", "counter", "shelf"], "terms": ["potted plant", "houseplant", "plant pot"], "target_dimension": "height", "target_min_m": 0.15, "target_max_m": 0.60},
+      {"canonical_class": "speaker", "placement_type": "surface", "support_classes": ["table", "desk", "counter", "shelf"], "terms": ["speaker", "subwoofer", "stereo speaker"], "target_dimension": "height", "target_min_m": 0.15, "target_max_m": 0.55},
+      {"canonical_class": "monitor", "placement_type": "surface", "support_classes": ["desk", "table", "counter"], "terms": ["computer monitor", "display monitor"], "target_dimension": "longest", "target_min_m": 0.35, "target_max_m": 0.80},
+      {"canonical_class": "laptop", "placement_type": "surface", "support_classes": ["desk", "table", "counter"], "terms": ["laptop", "notebook computer"], "target_dimension": "longest", "target_min_m": 0.25, "target_max_m": 0.50},
+      {"canonical_class": "keyboard", "placement_type": "surface", "support_classes": ["desk", "table"], "terms": ["keyboard", "computer keyboard"], "target_dimension": "longest", "target_min_m": 0.30, "target_max_m": 0.55},
+      {"canonical_class": "lamp", "placement_type": "surface", "support_classes": ["desk", "table", "counter", "shelf"], "terms": ["table lamp", "desk lamp"], "target_dimension": "height", "target_min_m": 0.20, "target_max_m": 0.65},
+      {"canonical_class": "chair", "placement_type": "floor", "support_classes": ["floor"], "terms": ["chair", "recliner", "stool"], "target_dimension": "height", "target_min_m": 0.65, "target_max_m": 1.25},
+      {"canonical_class": "sofa", "placement_type": "floor", "support_classes": ["floor"], "terms": ["sofa", "couch", "loveseat"], "target_dimension": "longest", "target_min_m": 1.20, "target_max_m": 2.80},
+      {"canonical_class": "cabinet", "placement_type": "floor", "support_classes": ["floor"], "terms": ["cabinet", "cupboard", "dresser"], "target_dimension": "height", "target_min_m": 0.60, "target_max_m": 2.20}
+    ]
+  },
+  "llm": {"enabled": false, "backend": "transformers", "model_path": "weights/Qwen3", "device": "cuda:0", "dtype": "bfloat16", "batch_size": 8, "max_new_tokens": 256, "trust_remote_code": false, "local_files_only": true, "temperature": 0.0, "max_retries": 2, "acceptance_threshold": 0.75},
+  "object_normalization": {"component_distance_ratio": 0.10, "upright_axis_candidates": ["+X", "-X", "+Y", "-Y", "+Z", "-Z"], "bottom_band_ratio": 0.03, "collision_decimation_faces": 20000, "minimum_footprint_ratio": 0.01, "maximum_scale_factor": 100.0, "minimum_scale_factor": 0.001, "uniform_scale_only": true},
+  "support": {"allowed_support_classes": ["table", "desk", "counter", "shelf", "cabinet", "floor"], "minimum_visible_views": 1, "maximum_slope_deg": 12.0, "plane_height_tolerance_m": 0.04, "adjacency_tolerance_m": 0.03, "minimum_patch_area_m2": 0.04, "boundary_margin_m": 0.03, "occupancy_cell_m": 0.02},
+  "placement": {"seed": 20260804, "objects_per_observation": 1, "max_object_trials": 12, "positions_per_surface": 24, "yaw_trials": 12, "minimum_support_coverage": 0.92, "minimum_clearance_m": 0.005, "maximum_penetration_m": 0.003, "minimum_camera_visible_ratio": 0.20, "camera_samples": 24, "object_visibility_samples": 256, "horizontal_fov_deg": 60.0}
+}

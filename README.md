@@ -4,11 +4,11 @@ SceneCompose is organized as three large stages:
 
 1. observer-centered scene partitioning;
 2. partition semantic/instance segmentation;
-3. object placement, constraint solving, and physical validation.
+3. object cataloging, placement, constraint solving, and GLB export.
 
 ## Observer-Centered Scene Partitioning
 
-The default pipeline samples a valid standing anchor from floor-like geometry, chooses a reference viewing direction, and exports a radius/angle-bounded local GLB with extra context for camera motion. Occluded geometry is retained. Semantic segmentation consumes these observation partitions, and the final object-composition stage will render the object together with its partition.
+The default pipeline samples a valid standing anchor from floor-like geometry, chooses a reference viewing direction, and exports a radius/angle-bounded local GLB with extra context for camera motion. Occluded geometry is retained. Semantic segmentation consumes these observation partitions, and the final object-composition stage exports the object together with its partition without rendering images.
 
 ### Requirements
 
@@ -233,3 +233,63 @@ bash scripts/run_observation_segmentation.sh data/work 0,1,2,3,4,5,6,7 8
 `--resume` is enabled by default. Use `--force-stage sam3`, for example, to invalidate SAM3 and all downstream artifacts while retaining geometry, views, and Mosaic3D results. Supported stage names are `geometry`, `views`, `mosaic3d`, `sam3`, `fusion`, and `export`.
 
 Each observation writes to `<observation-directory>/segmentation`. `point_labels.npz` and `face_labels.npz` include visibility counts; face labels also include `is_core`, so composition can reject context-only or unobserved support candidates. Important results are `fusion/point_labels.npz`, `fusion/face_labels.npz`, `fusion/instances.json`, `visualization/semantic.ply`, and `visualization/instances.ply`. See `docs/segmentation-artifacts.md` for schemas and coordinate conventions.
+
+## Scene and Object Composition
+
+Composition is intentionally split into two commands. `build-object-catalog` joins local GLBs to `annotations.json`, applies deterministic metadata/LVIS rules, optionally classifies unresolved assets with one locally loaded Qwen model, and asks Blender to record geometric profiles. `compose-observations` then extracts upward-facing, observed Core support patches from semantic face labels and performs scale, boundary, collision, and anchor-visibility checks before exporting one Object per observation.
+
+### Local Qwen deployment (no API)
+
+The default `configs/composition.json` has `llm.enabled: false`, so cataloging initially accepts only high-confidence rules. For local Qwen inference, install PyTorch matching the server CUDA driver and Transformers in the catalog environment. Qwen's official Transformers guide supports loading either a model identifier or a local directory; SceneCompose deliberately requires a local directory and `local_files_only: true`.
+
+Mamba environment additions:
+
+```bash
+mamba activate scenecompose
+python -m pip install "transformers>=4.51" accelerate safetensors
+```
+
+Pixi environment additions:
+
+```bash
+pixi run python -m pip install "transformers>=4.51" accelerate safetensors
+```
+
+Place a Transformers-format instruction model under the project, for example `weights/Qwen3-8B`, then edit only these fields:
+
+```json
+"llm": {
+  "enabled": true,
+  "backend": "transformers",
+  "model_path": "weights/Qwen3-8B",
+  "device": "cuda:0",
+  "dtype": "bfloat16",
+  "local_files_only": true
+}
+```
+
+The model is loaded once by the catalog process, non-thinking output is requested, results are validated against the configured canonical classes, and accepted classifications are cached in `data/work/object_catalog/llm_classification_cache.json`. No HTTP service or external API is used. See the [official Qwen Transformers guide](https://qwen.readthedocs.io/en/stable/inference/transformers.html).
+
+### Build the Object catalog
+
+After local GLBs are available under `data/obj`:
+
+```bash
+bash scripts/run_object_catalog.sh \
+  data/obj \
+  data/obj/metadata/annotations.json \
+  data/work/object_catalog
+```
+
+Use `scenecompose build-object-catalog ... --dry-run` to inspect discovery and rule counts without Blender or LLM execution. The complete catalog is `data/work/object_catalog/catalog.json`; individual profiles and classification cache are resumable.
+
+### Compose segmented observations
+
+```bash
+bash scripts/run_composition.sh \
+  data/work \
+  data/work/object_catalog/catalog.json \
+  data/composed
+```
+
+Each successful output directory contains `combined_scene.glb`, `placement.json`, `camera.json`, and `support_patches.json`. `camera.json` records a reference camera aimed from the observation anchor toward the placed object, but this stage does not render images. Failed observations retain `placement.json` with per-trial reasons.

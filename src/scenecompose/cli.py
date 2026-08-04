@@ -18,6 +18,8 @@ from scenecompose.segmentation.pipeline import (
     run_observation_segmentation_batch,
     run_segmentation_batch,
 )
+from scenecompose.composition.catalog import build_object_catalog
+from scenecompose.composition.pipeline import compose_observations
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -241,6 +243,48 @@ def _parser() -> argparse.ArgumentParser:
     segment_observations.add_argument("--force-stage", choices=STAGES)
     segment_observations.add_argument("--dry-run", action="store_true")
     segment_observations.set_defaults(handler=_segment_observations)
+
+    catalog = subparsers.add_parser(
+        "build-object-catalog", help="Classify and geometrically profile local Objaverse GLBs"
+    )
+    catalog.add_argument("--object-root", type=Path, default=PROJECT_ROOT / "data" / "obj")
+    catalog.add_argument(
+        "--metadata", type=Path,
+        default=PROJECT_ROOT / "data" / "obj" / "metadata" / "annotations.json",
+    )
+    catalog.add_argument(
+        "--output", type=Path, default=PROJECT_ROOT / "data" / "work" / "object_catalog"
+    )
+    catalog.add_argument(
+        "--config", type=Path, default=PROJECT_ROOT / "configs" / "composition.json"
+    )
+    catalog.add_argument("--blender", default=os.environ.get("SCENECOMPOSE_BLENDER", "blender"))
+    catalog.add_argument("--force", action="store_true")
+    catalog.add_argument("--dry-run", action="store_true")
+    catalog.set_defaults(handler=_build_object_catalog)
+
+    compose = subparsers.add_parser(
+        "compose-observations", help="Place one compatible Object in each segmented observation"
+    )
+    compose.add_argument("--observation-root", type=Path, default=PROJECT_ROOT / "data" / "work")
+    compose.add_argument(
+        "--catalog", type=Path,
+        default=PROJECT_ROOT / "data" / "work" / "object_catalog" / "catalog.json",
+    )
+    compose.add_argument(
+        "--output-root", type=Path, default=PROJECT_ROOT / "data" / "composed"
+    )
+    compose.add_argument(
+        "--config", type=Path, default=PROJECT_ROOT / "configs" / "composition.json"
+    )
+    compose.add_argument(
+        "--segmentation-config", type=Path,
+        default=PROJECT_ROOT / "configs" / "segmentation.json",
+    )
+    compose.add_argument("--blender", default=os.environ.get("SCENECOMPOSE_BLENDER", "blender"))
+    compose.add_argument("--force", action="store_true")
+    compose.add_argument("--dry-run", action="store_true")
+    compose.set_defaults(handler=_compose_observations)
     return parser
 
 
@@ -286,6 +330,21 @@ def _parse_gpus(value: str | None) -> tuple[int, ...] | None:
     if not gpus or any(gpu < 0 for gpu in gpus):
         raise SystemExit("--gpus must contain non-negative GPU ids")
     return gpus
+
+
+def _build_object_catalog(args: argparse.Namespace) -> int:
+    return build_object_catalog(
+        args.object_root.resolve(), args.metadata.resolve(), args.output.resolve(),
+        args.config.resolve(), args.blender, args.force, args.dry_run,
+    )
+
+
+def _compose_observations(args: argparse.Namespace) -> int:
+    return compose_observations(
+        args.observation_root.resolve(), args.catalog.resolve(), args.output_root.resolve(),
+        args.config.resolve(), args.segmentation_config.resolve(), args.blender,
+        args.force, args.dry_run,
+    )
 
 
 def main() -> int:

@@ -32,3 +32,6 @@ platforms = ["win-64", "linux-64"]
 scenecompose = { path = ".", editable = true }
 
 [tool.pixi.tasks]
+
+[tool.pixi.dependencies]
+python = "3.10.*"
