@@ -9,6 +9,7 @@ import numpy as np
 
 from .artifacts import save_npz_atomic
 from .config import SegmentationConfig
+from .model_lifecycle import release_cuda_model
 from .recap_clip import load_local_recap_clip
 
 
@@ -45,11 +46,16 @@ class Mosaic3DAdapter:
         self._module = None
         self._text_encoder = None
 
+    def release(self) -> None:
+        release_cuda_model(self, "_module", "_text_encoder")
+        self._torch = None
+
     def _load(self) -> None:
         if self._module is not None:
             return
         with _repository_import(self.repository):
             import torch
+            self._torch = torch
             from hydra import compose, initialize_config_dir
             from hydra.utils import instantiate
             with initialize_config_dir(version_base="1.3", config_dir=str(self.repository / "configs")):
@@ -63,7 +69,6 @@ class Mosaic3DAdapter:
                 raise RuntimeError(f"Mosaic3D checkpoint is missing network keys: {hard_missing[:8]}")
             module.net.to(self.device).eval()
             text_encoder = load_local_recap_clip(self.text_model_path, self.device)
-        self._torch = torch
         self._module = module
         self._text_encoder = text_encoder
 

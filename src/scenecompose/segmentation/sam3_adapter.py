@@ -11,6 +11,7 @@ import numpy as np
 
 from .artifacts import MaskObservation, encode_mask_rle, save_json_atomic
 from .config import SegmentationConfig
+from .model_lifecycle import release_cuda_model
 
 
 @contextmanager
@@ -30,7 +31,12 @@ class Sam3Adapter:
         self.device = device
         self.repository = (project_root / config.sam3.repository).resolve()
         self.checkpoint = (project_root / config.sam3.checkpoint).resolve()
+        self._torch = None
         self._processor = None
+
+    def release(self) -> None:
+        release_cuda_model(self, "_processor")
+        self._torch = None
 
     def _load(self) -> None:
         if self._processor is not None:
@@ -38,6 +44,8 @@ class Sam3Adapter:
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
         with _repository_import(self.repository):
+            import torch
+            self._torch = torch
             from sam3.model_builder import build_sam3_image_model
             from sam3.model.sam3_image_processor import Sam3Processor
             kwargs = {

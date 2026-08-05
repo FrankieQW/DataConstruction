@@ -15,7 +15,7 @@ SceneCompose 按 Inline Execution 组织为三个大步骤：
 ## 前置条件
 
 - Linux
-- Python 3.10 或更高版本
+- Python 3.12
 - Blender 4.5 LTS，可通过 `blender` 调用，或由 `SCENECOMPOSE_BLENDER` 指定
 - SceneCompose 环境和 Blender 内置 Python 均需提供 NumPy
 
@@ -56,33 +56,53 @@ Blender 独立于 Python 环境管理。可选择 Mamba 或 Pixi。
 ### 方法一：Mamba
 
 ```bash
-mamba create -n scenecompose -c conda-forge python=3.10 pip numpy
+mamba create -n scenecompose -c conda-forge python=3.12 pip numpy
 mamba activate scenecompose
 python -m pip install -e .
 export SCENECOMPOSE_BLENDER=/opt/blender/blender
 ```
 
-语义分割还需在同一环境安装 Mosaic3D 与 SAM3 依赖：
+语义分割在同一个环境中按阶段运行 Mosaic3D 和 SAM3。统一基线为 Python 3.12、PyTorch 2.7.0/cu126、torchvision 0.22.0 和 NumPy 1.26.4。不要执行 `pip install -r Mosaic3D/requirements.txt` 或 `pip install -e Mosaic3D`，两者都会要求 `torch==2.2.2`；当前 adapter 直接从本地 `Mosaic3D/` 加载源码。
 
 ```bash
-python -m pip install -r Mosaic3D/requirements.txt
-python -m pip install -e sam3
+mamba create -n scenecompose-seg -c conda-forge python=3.12 pip
+mamba activate scenecompose-seg
+python -m pip install torch==2.7.0 torchvision==0.22.0 \
+  --index-url https://download.pytorch.org/whl/cu126
+python -m pip install torch-scatter torch-cluster \
+  -f https://data.pyg.org/whl/torch-2.7.0+cu126.html
+python -m pip install spconv-cu120
+python -m pip install -r requirements/segmentation-unified-cu126.txt
+python -m pip install -e sam3 --no-deps
 python -m pip install -e .
+export SCENECOMPOSE_BLENDER=/opt/blender/blender
 ```
 
 ### 方法二：Pixi
 
 ```bash
 pixi init
-pixi add "python=3.10.*"
 pixi install
-pixi run python -m pip install -r Mosaic3D/requirements.txt
-pixi run python -m pip install -e sam3
+pixi run python -m pip install torch==2.7.0 torchvision==0.22.0 \
+  --index-url https://download.pytorch.org/whl/cu126
+pixi run python -m pip install torch-scatter torch-cluster \
+  -f https://data.pyg.org/whl/torch-2.7.0+cu126.html
+pixi run python -m pip install spconv-cu120
+pixi run python -m pip install -r requirements/segmentation-unified-cu126.txt
+pixi run python -m pip install -e sam3 --no-deps
 pixi run python -m pip install -e .
 export SCENECOMPOSE_BLENDER=/opt/blender/blender
 ```
 
-已有 `pixi.lock` 后只需执行 `pixi install`，无需再次执行 `pixi init`。安装 CUDA 依赖前应核对 `Mosaic3D/requirements.txt` 与服务器驱动是否匹配。
+已有 Pixi workspace 后无需再次执行 `pixi init`；`pyproject.toml` 已固定 Python 3.12。仓库中的 `pixi.lock` 可能仍记录旧的 Python 3.10 环境，服务器首次执行 `pixi install` 时必须先刷新锁文件，不能继续使用旧锁环境。`spconv-cu120` 是首选验证项；如果服务器上运行失败，再使用 CUDA 12.6 toolkit 源码编译 spconv。使用 cu126 PyTorch wheel 时，不要通过 `LD_LIBRARY_PATH` 混入其他小版本的系统 CUDA 动态库。
+
+安装后先执行不加载权重的环境检查：
+
+```bash
+python scripts/check_unified_segmentation_env.py
+```
+
+该命令检查版本、CUDA、PyG/spconv 以及两个模型构建路径的导入。通过后仍应先对一个 observation 做带权重的完整验证，再启动 8 个 worker。
 
 ## 自适应切分
 

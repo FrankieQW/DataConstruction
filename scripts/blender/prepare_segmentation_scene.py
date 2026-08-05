@@ -310,6 +310,8 @@ def _render_views(output: Path, geometry: dict[str, np.ndarray], samples: dict[s
     scene.render.resolution_percentage = 100
     scene.render.image_settings.file_format = "PNG"
     scene.view_layers[0].use_pass_z = True
+    if scene.world is None:
+        scene.world = bpy.data.worlds.new("SceneComposeWorld")
     scene.world.color = (0.08, 0.08, 0.08)
     light_data = bpy.data.lights.new("SceneComposeSun", type="SUN")
     light_data.energy = 2.0

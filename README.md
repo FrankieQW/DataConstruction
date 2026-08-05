@@ -17,7 +17,7 @@ The default pipeline samples a valid standing anchor from floor-like geometry, c
 ### Requirements
 
 - Linux
-- Python 3.10 or newer
+- Python 3.12
 - Blender 4.5 LTS available as `blender` or through `SCENECOMPOSE_BLENDER`
 - NumPy in the orchestration environment; Blender's bundled Python must also provide NumPy
 
@@ -180,29 +180,50 @@ Scene segmentation uses Mosaic3D for open-vocabulary 3D features, SAM3 for promp
 
 ### Additional environment requirements
 
-The inference environment must contain the Mosaic3D and SAM3 dependencies as well as SceneCompose. Mosaic3D currently pins PyTorch 2.2.2 in its requirements; build the CUDA environment around that constraint and install SAM3 into the same environment. SceneCompose never installs or downloads model weights.
+Mosaic3D and SAM3 run sequentially in one environment. The supported baseline is Python 3.12, PyTorch 2.7.0 with CUDA 12.6, torchvision 0.22.0, and NumPy 1.26.4. Each worker saves the Mosaic3D artifacts and releases its model and unused CUDA allocations before loading SAM3. SceneCompose never installs or downloads model weights.
 
-With Mamba, create a Python 3.10 inference environment:
+Do not run `pip install -r Mosaic3D/requirements.txt` or `pip install -e Mosaic3D` in this environment. Both declarations pin `torch==2.2.2`, and the full requirements also contain training, dataset, Open3D, and cuML dependencies that are not imported by the current Mosaic3D inference path.
+
+With Mamba:
 
 ```bash
-mamba create -n scenecompose-seg -c conda-forge python=3.10 pip
+mamba create -n scenecompose-seg -c conda-forge python=3.12 pip
 mamba activate scenecompose-seg
-python -m pip install -r Mosaic3D/requirements.txt
-python -m pip install -e sam3
+python -m pip install torch==2.7.0 torchvision==0.22.0 \
+  --index-url https://download.pytorch.org/whl/cu126
+python -m pip install torch-scatter torch-cluster \
+  -f https://data.pyg.org/whl/torch-2.7.0+cu126.html
+python -m pip install spconv-cu120
+python -m pip install -r requirements/segmentation-unified-cu126.txt
+python -m pip install -e sam3 --no-deps
 python -m pip install -e .
+export SCENECOMPOSE_BLENDER=/opt/blender/blender
 ```
 
-With Pixi, pin Python 3.10, install the locked SceneCompose dependencies, then install the two local model repositories:
+With Pixi, the repository `pyproject.toml` pins Python 3.12. The checked-in `pixi.lock` may still describe the former Python 3.10 environment; the first server-side `pixi install` must refresh it before the commands below are run. Run the same ABI-controlled installation inside the Pixi environment:
 
 ```bash
-pixi add "python=3.10.*"
 pixi install
-pixi run python -m pip install -r Mosaic3D/requirements.txt
-pixi run python -m pip install -e sam3
+pixi run python -m pip install torch==2.7.0 torchvision==0.22.0 \
+  --index-url https://download.pytorch.org/whl/cu126
+pixi run python -m pip install torch-scatter torch-cluster \
+  -f https://data.pyg.org/whl/torch-2.7.0+cu126.html
+pixi run python -m pip install spconv-cu120
+pixi run python -m pip install -r requirements/segmentation-unified-cu126.txt
+pixi run python -m pip install -e sam3 --no-deps
 pixi run python -m pip install -e .
+export SCENECOMPOSE_BLENDER=/opt/blender/blender
 ```
 
-Review `Mosaic3D/requirements.txt` before installation because its CUDA wheels must match the server driver. No command above downloads checkpoints.
+`spconv-cu120` is the first validation target because spconv 2.x is not tied to the PyTorch binary ABI. If it fails on the server, build spconv against the server CUDA 12.6 toolkit instead. Do not mix a different system CUDA `lib64` into `LD_LIBRARY_PATH` while using the cu126 PyTorch wheel.
+
+After installation, check the shared environment without loading checkpoints:
+
+```bash
+python scripts/check_unified_segmentation_env.py
+```
+
+This verifies the ABI baseline and imports both model construction paths. A successful result does not prove checkpoint compatibility; validate that with one observation before starting eight workers.
 
 ### Checkpoint configuration
 

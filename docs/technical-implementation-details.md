@@ -192,6 +192,10 @@ GLB 重新导入后可能改变对象枚举顺序，因此后续通过“对象�
 geometry -> views -> mosaic3d -> sam3 -> fusion -> export
 ```
 
+Mosaic3D 与 SAM3 使用同一个 Python 3.12 / PyTorch 2.7.0-cu126 环境，但不会同时常驻显存。`mosaic3d` 阶段创建 Mosaic3D 与 ReCap-CLIP，输出文件完成原子写入后，在 `finally` 中移除模型引用、执行 Python 垃圾回收并调用 `torch.cuda.empty_cache()`；随后 `sam3` 阶段才构建 SAM3。SAM3 无论成功或抛出异常也执行相同释放流程。这里的 `empty_cache()` 只归还 PyTorch 已不再使用的缓存块，不会释放仍被 Python 对象引用的 Tensor，因此模型引用清理必须先发生。
+
+统一环境固定为 Python 3.12、PyTorch 2.7.0/cu126、torchvision 0.22.0 和 NumPy 1.26.4。Mosaic3D 的完整 `requirements.txt` 和项目元数据包含 `torch==2.2.2`，不能安装到该环境；当前 adapter 直接从本地 `Mosaic3D/` 导入源码，只安装 `requirements/segmentation-unified-cu126.txt` 中当前推理路径实际需要的依赖。Open3D、cuML、数据集和训练工具不属于当前推理路径。
+
 状态写入 `segmentation/manifest.json`。每一阶段记录：
 
 - 当前状态：`pending/running/complete/failed`；

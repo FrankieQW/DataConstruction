@@ -27,6 +27,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 BLENDER_SCRIPT = PROJECT_ROOT / "scripts" / "blender" / "prepare_segmentation_scene.py"
 
 
+def _run_model_stage(adapter, infer: Callable[[object], list[Path]]) -> list[Path]:
+    try:
+        return infer(adapter)
+    finally:
+        adapter.release()
+
+
 def _mosaic_external_files(config: SegmentationConfig) -> tuple[Path, ...]:
     text_model_dir = (PROJECT_ROOT / config.mosaic3d.text_model_path).resolve()
     return (
@@ -98,14 +105,18 @@ def run_scene(
     )
     upstream = _stage(
         manifest, "mosaic3d", config, upstream, resume, logs / "mosaic3d.log",
-        lambda: Mosaic3DAdapter(PROJECT_ROOT, config, "cuda:0").infer(
-            output / "geometry" / "samples.npz", output / "mosaic3d"
+        lambda: _run_model_stage(
+            Mosaic3DAdapter(PROJECT_ROOT, config, "cuda:0"),
+            lambda adapter: adapter.infer(output / "geometry" / "samples.npz", output / "mosaic3d"),
         ),
         external_files=_mosaic_external_files(config),
     )
     upstream = _stage(
         manifest, "sam3", config, upstream, resume, logs / "sam3.log",
-        lambda: Sam3Adapter(PROJECT_ROOT, config, "cuda:0").infer(output / "views" / "rgb", output / "sam3"),
+        lambda: _run_model_stage(
+            Sam3Adapter(PROJECT_ROOT, config, "cuda:0"),
+            lambda adapter: adapter.infer(output / "views" / "rgb", output / "sam3"),
+        ),
         external_files=((PROJECT_ROOT / config.sam3.checkpoint).resolve(),),
     )
 
@@ -171,14 +182,16 @@ def run_observation(
     )
     upstream = _stage(
         manifest, "mosaic3d", config, upstream, resume, logs / "mosaic3d.log",
-        lambda: Mosaic3DAdapter(PROJECT_ROOT, config, "cuda:0").infer(
-            output / "geometry" / "samples.npz", output / "mosaic3d"
+        lambda: _run_model_stage(
+            Mosaic3DAdapter(PROJECT_ROOT, config, "cuda:0"),
+            lambda adapter: adapter.infer(output / "geometry" / "samples.npz", output / "mosaic3d"),
         ), external_files=_mosaic_external_files(config),
     )
     upstream = _stage(
         manifest, "sam3", config, upstream, resume, logs / "sam3.log",
-        lambda: Sam3Adapter(PROJECT_ROOT, config, "cuda:0").infer(
-            output / "views" / "rgb", output / "sam3"
+        lambda: _run_model_stage(
+            Sam3Adapter(PROJECT_ROOT, config, "cuda:0"),
+            lambda adapter: adapter.infer(output / "views" / "rgb", output / "sam3"),
         ), external_files=((PROJECT_ROOT / config.sam3.checkpoint).resolve(),),
     )
 

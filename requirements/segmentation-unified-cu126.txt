@@ -1,0 +1,39 @@
+# Install torch and the PyG CUDA wheels first as documented in README.md.
+# This file intentionally excludes Mosaic3D training/data dependencies,
+# open3d, cuML, and Mosaic3D's torch==2.2.2 package metadata.
+numpy==1.26.4
+scipy>=1.14,<2
+Pillow>=10,<13
+imageio>=2.34,<3
+OpenEXR>=3,<4
+trimesh>=4,<5
+plyfile>=1,<2
+lightning==2.2.*
+torchmetrics>=0.11.4
+hydra-core==1.3.2
+hydra-colorlog==1.2.0
+omegaconf>=2.3,<3
+rootutils
+rich
+fire
+overrides
+easydict
+addict
+PyYAML
+tqdm
+matplotlib
+transformers>=4.51,<5
+clip @ git+https://github.com/openai/CLIP.git
+einops
+natsort
+scikit-image
+scikit-learn
+open_clip_torch
+jaxtyping
+loguru
+timm>=1.0.17
+ftfy==6.1.1
+regex
+iopath>=0.1.10
+typing_extensions
+huggingface_hub
