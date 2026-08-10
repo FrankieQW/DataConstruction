@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Environments and local configuration
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.conda/
+
+# IDE and OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Logs, temporary files and model caches
+logs/
+tmp/
+*.tmp
+*.partial
+models/
+.cache/
+.huggingface/
+
+# Generated project artifacts
+data/cache/
+outputs/
+data/object/object_rejects.jsonl
+data/annotation_cache.jsonl
+data/annotation_review.jsonl
+
+# Large source assets and downloaded caches
+*.blend
+*.blend1
+*.fbx
+*.glb
+*.gltf
+*.bin
+*.dds
+*.tga
+*.hdr
+data/object/Objaverse/object-paths.json
+data/object/metadata/cache/
+

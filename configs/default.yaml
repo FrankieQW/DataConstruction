@@ -1,0 +1,86 @@
+project:
+  # Relative to this config file.
+  root: ..
+  schema_version: "1.0"
+  seed: 20260810
+
+paths:
+  object_inventory: data/object/Objaverse.md
+  lvis_annotations: data/object/Objaverse/lvis-annotations.json
+  object_paths: data/object/Objaverse/object-paths.json
+  object_metadata: data/object/metadata/annotations.json
+  object_output: data/object/object.json
+  object_rejects: data/object/object_rejects.jsonl
+
+  scene_root: data/scene
+  scene_output: data/scene/scene.json
+  scene_cache: data/cache/scenes
+  scene_review_jsonl: outputs/reports/scene_group_review.jsonl
+  scene_review_html: outputs/reports/scene_group_review.html
+  scene_review_assets: outputs/reports/scene_group_review_assets
+
+  annotation_output: data/annotation_construction.json
+  annotation_cache: data/annotation_cache.jsonl
+  annotation_review: data/annotation_review.jsonl
+
+object:
+  expected_selected_count: 80
+  expected_unique_category_count: 74
+  strict_expected_counts: true
+  license_allowlist: []
+
+scene:
+  blender_bin: /opt/blender-4.5/blender
+  expected_blender_major_minor: "4.5"
+  allow_blender_version_mismatch: false
+  fbx_glob: "**/*.fbx"
+  workers: 1
+  resume: true
+  id_hash_length: 16
+  aliases_file: configs/category_aliases.yaml
+  overrides_file: configs/scene_overrides.yaml
+  render_review_images: false
+  review_random_fraction: 0.10
+  review_minimum_per_scene: 100
+  review_frequent_minimum: 20
+  low_confidence_threshold: 0.90
+  support_categories:
+    - bar
+    - bench
+    - cabinet
+    - counter
+    - desk
+    - floor
+    - shelf
+    - stool
+    - table
+  non_replaceable_categories:
+    - building
+    - ceiling
+    - floor
+    - road
+    - sidewalk
+    - sky
+    - wall
+    - window
+  frequent_review_categories:
+    - beer_glass
+    - bottle
+    - chair
+    - cutlery
+    - plate
+    - table
+    - water_glass
+    - wine_glass
+
+annotation:
+  base_url: http://127.0.0.1:8000/v1
+  api_key: EMPTY
+  model: Qwen/Qwen3-14B
+  prompt_version: v1
+  concurrency: 16
+  request_timeout_seconds: 120
+  max_retries: 4
+  confidence_review_threshold: 0.80
+  allow_partial: false
+  disable_thinking: true

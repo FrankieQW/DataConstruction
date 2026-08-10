@@ -1,0 +1,17 @@
+name: lc-core
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - pillow
+  - pyyaml
+  - tqdm
+  - pip:
+      - -e .
+      - orjson>=3.10,<4
+      - pydantic>=2.9,<3
+      - openai>=1.54,<3
+

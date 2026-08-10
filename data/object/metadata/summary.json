@@ -1,0 +1,22 @@
+{
+  "annotation_count": 1000,
+  "artifacts": [
+    "annotations.json",
+    "annotations.jsonl",
+    "sample.json",
+    "lvis_categories.json",
+    "missing_uids.txt",
+    "summary.json"
+  ],
+  "cache_hit_count": 0,
+  "downloaded_file_count": 161,
+  "lvis_match_count": 80,
+  "lvis_skipped": false,
+  "manifest": "E:\\programs\\dataconstruction\\data\\obj\\Objaverse.md",
+  "missing_count": 0,
+  "output": "E:\\programs\\dataconstruction\\data\\obj\\metadata",
+  "requested_object_count": 1000,
+  "schema_version": 1,
+  "shard_count": 160,
+  "warnings": []
+}

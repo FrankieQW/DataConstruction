@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lightconstruction"
+version = "0.1.0"
+description = "Objaverse and FBX scene annotation preparation for controllable-lighting data synthesis"
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=1.54,<3",
+  "orjson>=3.10,<4",
+  "pydantic>=2.9,<3",
+  "PyYAML>=6.0,<7",
+  "tqdm>=4.66,<5",
+]
+
+[project.scripts]
+lightconstruction = "lightconstruction.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
