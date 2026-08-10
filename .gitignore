@@ -57,3 +57,5 @@ data/annotation_review.jsonl
 data/object/Objaverse/object-paths.json
 data/object/metadata/cache/
 
+# harness
+.codex

@@ -137,3 +137,76 @@ class AnnotationDocument(StrictModel):
     object_index: dict[str, str]
     unresolved_pairs: list[dict[str, Any]]
     stats: dict[str, Any]
+
+
+class PreparedGeometry(StrictModel):
+    object_uid: str
+    object_category: str
+    asset_path: str
+    asset_digest: str
+    target_dimensions: list[float] = Field(min_length=3, max_length=3)
+    up_axis: str
+    front_axis: str
+    contact_axis: str
+    fit_mode: str
+    config_source: str
+    license: dict[str, Any]
+
+
+class PreparedGeometryDocument(StrictModel):
+    schema_version: str
+    generated_at: str
+    generator_version: str
+    config_digest: str
+    object_digest: str
+    geometry_config_digests: dict[str, str]
+    object_root_env: str
+    geometries: list[PreparedGeometry]
+    quarantine: list[dict[str, Any]]
+    stats: dict[str, Any]
+
+
+class CompositionTarget(StrictModel):
+    relation: str
+    entity_id: str
+    node_ids: list[str] = Field(min_length=1)
+    category: str
+    center_world: list[float] = Field(min_length=3, max_length=3)
+    dimensions_world: list[float] = Field(min_length=3, max_length=3)
+    bottom_center_world: list[float] = Field(min_length=3, max_length=3)
+    desired_dimensions: list[float] = Field(min_length=3, max_length=3)
+    yaw_degrees: float
+
+
+class RenderJob(StrictModel):
+    schema_version: str
+    job_id: str
+    seed: int
+    annotation_id: str
+    object_uid: str
+    object_category: str
+    object_asset_path: str
+    prepared_geometry: PreparedGeometry
+    base_scene_id: str
+    base_scene_blend: str
+    base_scene_digest: str
+    target: CompositionTarget
+    camera: dict[str, Any]
+    lighting_profile: dict[str, Any]
+    fixture_candidate_entity_ids: list[str]
+    lineage: dict[str, Any]
+    license: dict[str, Any]
+
+
+class RenderJobDocument(StrictModel):
+    schema_version: str
+    generated_at: str
+    generator_version: str
+    config_digest: str
+    annotation_digest: str
+    object_digest: str
+    scene_digest: str
+    prepared_geometry_digest: str
+    jobs: list[RenderJob]
+    rejects: list[dict[str, Any]]
+    stats: dict[str, Any]

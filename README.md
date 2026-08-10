@@ -1,361 +1,650 @@
-# LightConstruction
+# LightConstruction：从 scene/object 标注到 TokenLight 训练
 
-LightConstruction 用于整理 Objaverse 对象资产和 FBX 场景资产，并生成“对象可以放置到哪些场景实体上、可以替换哪些场景实体”的预组合语义标注。后续将把这些标注接入 Blender 常驻场景 worker，在不同相机与光照条件下即时组合和渲染训练数据，用于训练光照可控的 diffusion 图像生成模型。
+LightConstruction 把 Objaverse 对象、带语义命名的 Bistro 场景和 `annotation_construction.json` 转成 TokenLight 所需的线性光照分量数据，并把数据验证、固定 manifest 训练 smoke、checkpoint 恢复和正式训练串成一条可审计流程。
 
-项目的完整规划覆盖 M0–M5；当前代码实现到 M3：
+当前代码覆盖：
 
-- M0：配置、数据协议、严格 schema 和统一 CLI。
-- M1：构建 `data/object/object.json`。
-- M2：构建归一化 scene `.blend`、`data/scene/scene.json` 和人工抽检报告。
+- M1：生成 `data/object/object.json`。
+- M2：把 FBX 转成保留稳定 entity ID 的 `.blend`，生成 `data/scene/scene.json`。
 - M3：使用本地 vLLM 生成 `data/annotation_construction.json`。
-- M4：对象几何归一化、放置/替换、碰撞检测、常驻 Blender worker 和渲染。尚未实现，等待训练代码加入后适配。
-- M5：文档与端到端验收。本 README 先覆盖 M0–M3；M4 完成后再补充真实训练和渲染命令。
+- M4：准备对象几何契约、生成确定性组合 job、在 Bistro 中执行 place/replace，并渲染 TokenLight 分量。
+- M5：严格验证、object/scene 隔离切分、Dataset smoke、训练 smoke、checkpoint 恢复和发布记录。
 
-完整设计、数据协议、风险和 M4 算法见 [`plan.md`](plan.md)。
+完整设计背景见 [`plan.md`](plan.md)，实现与验收清单见 [`TOKENLIGHT_ADAPTATION_IMPLEMENTATION_PLAN.md`](TOKENLIGHT_ADAPTATION_IMPLEMENTATION_PLAN.md)。TokenLight 模型细节仍由 [`Lumina-T2X/lumina_next_t2i/TOKENLIGHT_GUIDE.md`](Lumina-T2X/lumina_next_t2i/TOKENLIGHT_GUIDE.md) 维护；本文是从原始数据到训练验收的主入口。
 
-## 1. 当前数据范围
-
-### Object 数据
-
-- 清单：`data/object/Objaverse.md`
-- LVIS 标注：`data/object/Objaverse/lvis-annotations.json`
-- UID 到 GLB 路径：`data/object/Objaverse/object-paths.json`
-- metadata：`data/object/metadata/annotations.json`
-- 实际处理范围：Markdown 清单与 LVIS 标注的严格交集，共 80 个对象、74 个归一化类别。
-
-M1 只构建索引，不会从服务器下载或读取全部 GLB。GLB 在服务器上的根目录将在 M4 通过 `OBJECT_ROOT` 接入。
-
-### Scene 数据
-
-当前处理 `data/scene` 下递归发现的三份 Bistro FBX：
-
-- `BistroInterior.fbx`
-- `BistroInterior_Wine.fbx`
-- `BistroExterior.fbx`
-
-FBX 导入后，每个 mesh 都会获得稳定的 `lc_scene_object_id` 自定义属性。`scene.json` 中的 `node_id` 与该属性一致，因此后续可以直接在归一化 `.blend` 中找到对应物体，不依赖不稳定的 Blender 显示名称。
-
-## 2. 当前目录结构
+## 1. 端到端数据流
 
 ```text
-.
-├── configs/
-│   ├── default.yaml
-│   ├── category_aliases.yaml
-│   ├── scene_overrides.yaml
-│   ├── category_dimensions.yaml      # M4 预留
-│   └── object_overrides.yaml         # M4 预留
-├── data/
-│   ├── object/
-│   ├── scene/
-│   └── annotation_construction.json  # M3 正式输出
-├── scripts/
-│   └── blender_entry.py
-├── src/lightconstruction/
-├── environment-core.yml
-├── environment-llm.yml
-├── plan.md
-└── pyproject.toml
+Objaverse inventory + metadata
+              ↓
+        prepare-objects
+              ↓
+       data/object/object.json
+
+Bistro FBX ── prepare-scenes ──→ normalized .blend + data/scene/scene.json
+                                      ↓
+object.json + scene.json ── annotate-construction
+                                      ↓
+                      annotation_construction.json
+                                      ↓
+      prepare-geometry ──→ prepared_geometry.json + quarantine
+                                      ↓
+      build-render-jobs ──→ deterministic render_jobs.jsonl
+                                      ↓
+             Blender composition render
+                                      ↓
+ ambient / dark / point / diffuse / fixture components + metadata
+                                      ↓
+        build_manifests → validate_components → inspect_dataset
+                                      ↓
+                 fixed-manifest training smoke
+                                      ↓
+                    checkpoint resume smoke
+                                      ↓
+                    formal train / evaluate
 ```
 
-生成的 `.blend`、缓存、日志、抽检图片和渲染输出已写入 `.gitignore`。`object.json`、`scene.json` 和 `annotation_construction.json` 没有被忽略，可在人工验收后选择纳入版本管理。
+`annotation_construction.json` 只表达语义允许关系，例如某类对象能放在什么 entity 上、能替换什么 entity。具体对象、场景、target、transform、相机、灯具和随机 seed 都在可重建的 `render_jobs.jsonl` 中冻结。
 
-## 3. 环境配置
+## 2. 关键语义边界
 
-### 3.1 基础环境 `lc-core`
+### place 与 replace
 
-建议在仓库根目录执行：
+- 每个可用的 `object_uid × base_scene_id` 最多生成一个固定组合 job。
+- 当同一组合同时允许 place 和 replace 时，按 `m4.relation_priority` 选择；默认优先 replace。
+- place 将对象底面中心对齐到 support entity 顶面中心，并检查对象 XY footprint 不超过支撑面限制。
+- replace 隐藏目标 entity 对应的 mesh，将对象按目标包围盒进行 uniform fit。
+- 每个 Blender job 都重新打开只读 base `.blend`，不会把上一个样本的状态带入下一个样本。
 
-```bash
-conda env create -f environment-core.yml
-conda activate lc-core
+### `in_scene_light`
+
+固定组合和相机以后执行 real-first/fallback：
+
+1. 从 `fixture_candidate_entity_ids` 找真实灯具候选。
+2. 为每个候选渲染带遮挡的可见 mask。
+3. 按可见像素降序、距画面中心升序、entity ID 字典序选择。
+4. 有合格真实灯具时：
+   - `fixture_source: scene_native`
+   - 使用真实灯具 mesh 作为 fixture
+   - 不创建程序化球体
+5. 没有合格候选时：
+   - 创建球形 fixture
+   - `fixture_source: procedural_fallback`
+
+两种来源都使用受控点光产生独立 `_on.exr`，但 mask 覆盖的几何来源不同。最终统计必须分别报告二者数量。
+
+### TokenLight 线性分量
+
+组件渲染时禁用 Bistro 原生解析灯和自发光能量。ambient 之后将 World strength 设为零，确保现有 Dataset 公式不会重复计入环境光：
+
+```text
+ambient_scale  = dark + (ambient - dark) * scale
+global_diffuse = ambient + diffuse_component - dark
+add_light      = ambient + max(point_component - dark, 0) * color * intensity
+in_scene_light = ambient + max(fixture_on - dark, 0) * color * intensity * transition
 ```
 
-环境文件会以 editable 模式安装当前项目。若代码更新后入口不可用，可重新执行：
+## 3. 目录与正式产物
+
+```text
+configs/
+  default.yaml
+  category_dimensions.yaml
+  object_overrides.yaml
+  scene_overrides.yaml
+data/
+  object/object.json
+  scene/scene.json
+  annotation_construction.json
+outputs/
+  manifests/
+    prepared_geometry.json
+    render_jobs.jsonl
+    render_jobs.summary.json
+  reports/
+    geometry_quarantine.jsonl
+    render_job_rejects.jsonl
+  tokenlight_dataset/
+    components/<job_id>/
+      ambient.exr
+      dark.exr
+      point_lights/*.exr
+      diffuse/*.exr
+      in_scene_lights/*_on.exr
+      in_scene_lights/*_mask.png
+      metadata.json
+    manifests/{train,validation,test}.jsonl
+    validation_summary.json
+    validation_errors.jsonl
+    dataset_release.json
+    render_errors.jsonl
+```
+
+`metadata.json` 包含 composition transform、相机与 canonical 坐标、fixture 来源、base scene fingerprint、输入 digests、许可证决策和生成器版本。只有通过 validator 的 metadata 才能进入正式 manifest。
+
+## 4. 环境
+
+建议分开准备数据环境、Blender 和 TokenLight 训练环境。
+
+### LightConstruction
 
 ```bash
+conda create -n lightconstruction python=3.11 -y
+conda activate lightconstruction
 pip install -e .
 ```
 
-检查 CLI：
+M1–M4 外层命令均从仓库根运行：
 
 ```bash
 python -m lightconstruction.cli --help
 ```
 
-### 3.2 LLM 环境 `lc-llm`
+### Blender
 
-vLLM 单独使用一个环境，避免其 PyTorch/CUDA 依赖与数据处理环境冲突：
-
-```bash
-conda env create -f environment-llm.yml
-conda activate lc-llm
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-vllm --version
-```
-
-`environment-llm.yml` 给出项目建议范围，但 CUDA、驱动和 PyTorch 的最终组合应根据 A100 服务器实际环境锁定。
-
-### 3.3 Blender 4.5
-
-Blender 作为独立程序安装，相关脚本由 Blender 自带 Python 执行，不要在 Conda 环境中安装 `bpy`。
+`configs/default.yaml` 默认指向 `/opt/blender-4.5/blender`。服务器先确认：
 
 ```bash
 /opt/blender-4.5/blender --version
 ```
 
-M2 默认严格要求 Blender 4.5.x。其他版本不会被静默接受，因为不同 FBX importer 版本可能产生不同名称、层级、材质和灯光行为。
+M2 默认要求 Blender 4.5。M4 composition worker 通过 `--factory-startup` 启动，并为每个 job 重新打开 base blend。
 
-## 4. 完整运行流程：M0–M3
-
-以下命令都从仓库根目录执行。
-
-### 4.1 M1：生成 Object 索引
+### TokenLight
 
 ```bash
-conda activate lc-core
-
-python -m lightconstruction.cli prepare-objects \
-  --config configs/default.yaml \
-  --inventory-mode markdown \
-  --workers 16
+cd Lumina-T2X
+conda create -n tokenlight python=3.11 -y
+conda activate tokenlight
+pip install -e .
 ```
 
-正式输出：
+训练还需要与服务器匹配的 PyTorch、CUDA、Flash Attention、VAE 和 Lumina-Next-T2I 2B 单 shard checkpoint。上游 checkpoint 加载时只允许 TokenLight 新增的 `lighting_encoder` 和 `fixture_mask_embedder` keys 缺失。
+
+## 5. 正式运行前必须填写的配置
+
+代码会拒绝猜测对象尺度和许可证。以下配置为空时不能进入正式 M4。
+
+### `OBJECT_ROOT`
+
+`object.json` 保存相对 canonical asset path，实际根目录通过环境变量提供：
+
+```bash
+export OBJECT_ROOT=/mnt/afs_fangwenqi/data/Objaverse
+```
+
+### 对象许可证白名单
+
+在 `configs/default.yaml` 中填写已经批准的许可证名称：
+
+```yaml
+object:
+  license_allowlist: [CC0, CC-BY-4.0]
+```
+
+这里的值必须与 `object.json` 的规范化 `license` 完全匹配。空白名单在 `m4.enforce_license_allowlist: true` 时会直接失败。
+
+### Bistro 许可证与用途政策
+
+不要使用示例值。由责任方确认后填写：
+
+```yaml
+m4:
+  license_policy_version: your-approved-policy-v1
+  base_scene_license:
+    name: <approved license>
+    source_uri: <canonical source>
+    attribution: <required attribution>
+    decision: allowed
+```
+
+未设置 `decision: allowed` 时，render job 为 `unverified`，正式 renderer 默认拒绝执行。
+
+### 对象尺寸与朝向
+
+`configs/category_dimensions.yaml` 为类别默认值：
+
+```yaml
+categories:
+  mug:
+    target_dimensions: [0.10, 0.10, 0.12]
+    up_axis: +Z
+    front_axis: -Y
+    contact_axis: -Z
+    fit_mode: uniform_fit
+```
+
+`configs/object_overrides.yaml` 只保存已审阅的对象例外：
+
+```yaml
+objects:
+  <objaverse_uid>:
+    target_dimensions: [0.20, 0.08, 0.12]
+    up_axis: +Y
+    front_axis: +Z
+    contact_axis: -Y
+    fit_mode: uniform_fit
+```
+
+未知类别、缺失资产、错误轴、非白名单许可证和 `disabled: true` 对象进入 quarantine，不会被隐式缩放后渲染。
+
+## 6. M1：生成 object 数据
+
+输入：
+
+- `data/object/Objaverse.md`
+- `data/object/Objaverse/lvis-annotations.json`
+- `data/object/Objaverse/object-paths.json`
+- `data/object/metadata/annotations.json`
+
+运行：
+
+```bash
+python -m lightconstruction.cli prepare-objects \
+  --config configs/default.yaml \
+  --inventory-mode markdown
+```
+
+输出：
 
 - `data/object/object.json`
 - `data/object/object_rejects.jsonl`
 
-程序会执行以下检查：
+M1 只构建索引和来源信息，不遍历服务器上的全部 GLB。
 
-- Markdown 中的路径必须符合 `<shard>/<32位UID>.glb`。
-- UID 必须存在于 LVIS 标注和 object path map。
-- 合并类别、许可证、作者、来源 URI、名称、tags、GLB 统计和缩略图。
-- 默认严格要求得到 80 个对象和 74 个归一化类别；数量变化会直接报错。
-- 正式 JSON 在写盘前通过 Pydantic schema，并采用原子替换，避免留下半个文件。
+## 7. M2：生成 scene 数据和归一化 blend
 
-### 4.2 M2：提取 Scene 并生成归一化 Blend
-
-第一次运行建议只启动一个 Blender 进程：
+把 FBX 放到 `data/scene/`，运行：
 
 ```bash
-conda activate lc-core
-
 python -m lightconstruction.cli prepare-scenes \
   --config configs/default.yaml \
   --blender-bin /opt/blender-4.5/blender \
-  --workers 1
+  --workers 1 \
+  --resume
 ```
 
-确认服务器内存余量后可把 `--workers` 提高到 2。每个 FBX 使用独立 Blender 子进程，绝不在线程间共享 `bpy`。
+输出：
 
-正式输出：
-
-- `data/cache/scenes/<scene_id>.blend`
 - `data/scene/scene.json`
+- `data/cache/scenes/<scene_id>.blend`
 - `outputs/reports/scene_group_review.jsonl`
 - `outputs/reports/scene_group_review.html`
 
-每个 scene mesh 对应一个 `node`；逻辑物体对应一个 `entity`，entity 通过 `node_ids` 引用 mesh。当前实现采用保守的单 mesh 初始分组，再通过人工抽检和 overrides 合并、拆分或改类，避免自动错误合并相邻的重复杯子、椅子等实例。
+每个 Blender object 保留：
 
-程序会验证：
+- `lc_scene_object_id`
+- `lc_scene_entity_id`
+- `lc_scene_category`
+- `lc_raw_import_name`
 
-- `scene_id`、`node_id` 和 `entity_id` 唯一。
-- 每个 entity 引用的 node 都存在。
-- 一个 node 不会同时属于多个 entity。
-- 每个 mesh node 都有对应 entity。
-- transform、AABB/OBB、材质、面数和顶点数符合 schema。
+人工修正只写入 `configs/scene_overrides.yaml`，然后重新生成 `scene.json`；不要手工编辑正式 JSON。
 
-#### 人工抽检与修正
+## 8. M3：生成 `annotation_construction.json`
 
-抽检优先覆盖：
-
-- 类别或分组置信度低于阈值的 entity。
-- 多 mesh entity。
-- 所有 `replaceable=true` 或 `support_surface=true` 的 entity。
-- glass、bottle、plate、chair、table 等高频类别。
-- 其余 entity 的固定随机种子分层样本。
-
-不要直接编辑生成的 `scene.json`。把修正写入：
-
-```text
-configs/scene_overrides.yaml
-```
-
-支持的修正包括：
-
-- `rename_categories`
-- `entity_flags`
-- `merge_entities`
-- `split_entities`
-
-修改后重新运行 `prepare-scenes`。默认开启缓存复用；只要 FBX 和配置摘要没有改变，就不会重复导入 FBX，但会重新应用 entity overrides 并生成最终 `scene.json`。
-
-如需生成 context、isolated、top 三种抽检预览，将 `configs/default.yaml` 中的：
-
-```yaml
-scene:
-  render_review_images: false
-```
-
-改为 `true` 后重新运行。预览数量可能很大，建议先在一份 scene 或较小抽检集上确认资源开销。
-
-### 4.3 M3：启动 Qwen3-14B
-
-在第一个终端中启动 OpenAI-compatible vLLM 服务：
+先启动 OpenAI-compatible vLLM：
 
 ```bash
-conda activate lc-llm
-
-vllm serve Qwen/Qwen3-14B \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --dtype bfloat16 \
-  --gpu-memory-utilization 0.90 \
-  --max-model-len 4096 \
-  --generation-config vllm
+vllm serve Qwen/Qwen3-14B --host 127.0.0.1 --port 8000
 ```
 
-默认关闭 Qwen thinking，使用 `temperature=0` 和严格 JSON Schema。LLM 只判断类别之间的语义关系，不负责尺度、姿态或碰撞。
-
-### 4.4 M3：生成预组合标注
-
-在第二个终端中执行：
+再运行：
 
 ```bash
-conda activate lc-core
-
 python -m lightconstruction.cli annotate-construction \
   --config configs/default.yaml \
   --base-url http://127.0.0.1:8000/v1 \
   --model Qwen/Qwen3-14B \
-  --concurrency 16 \
-  --resume
+  --concurrency 16
 ```
 
-正式输出：
+输出：
 
 - `data/annotation_construction.json`
 - `data/annotation_cache.jsonl`
 - `data/annotation_review.jsonl`
 
-M3 先按类别聚合，不对 object UID 和 scene entity 做实例级笛卡尔积。放置只保留支撑面类别，替换只保留词形、同义词或名称相似的候选，然后由 LLM 输出：
+必须确认 `unresolved_pairs` 符合预期，且文件中的 object/scene digest 与当前输入一致。M4 会拒绝 stale annotation。
 
-- `can_place_on`
-- `can_replace`
-- `confidence`
-- `reason`
+## 9. M4：几何准备和组合 job
 
-类别规则随后确定性展开为 scene entity ID。最终 JSON 中每个 object 类别都有 `place_on_entity_ids` 和 `replace_entity_ids`，即使两者都是空集合也会明确保存。
-
-## 5. 断点续跑和失败处理
-
-### Scene
-
-M2 根据 FBX digest 和配置 digest 复用：
-
-```text
-data/cache/scenes/fragments/
-data/cache/scenes/*.blend
-```
-
-使用 `--no-resume` 可强制重新导入。某个 FBX 失败时，错误会写入：
-
-```text
-data/cache/scenes/scene_failures.json
-data/cache/scenes/logs/
-```
-
-只有全部 scene 成功后才会更新正式 `scene.json`。
-
-### LLM
-
-每个成功的类别对会立即追加到 `data/annotation_cache.jsonl`。进程中断后重新运行同一命令即可自动复用成功结果。
-
-如果仍有请求失败，程序先写 review queue，然后拒绝生成不完整的正式标注。只有明确接受不完整结果时才使用：
+### 9.1 几何准备
 
 ```bash
-python -m lightconstruction.cli annotate-construction \
+python -m lightconstruction.cli prepare-geometry \
+  --config configs/default.yaml
+```
+
+检查：
+
+```text
+outputs/manifests/prepared_geometry.json
+outputs/reports/geometry_quarantine.jsonl
+```
+
+正式批次前应逐项解释 quarantine。不能为了提高成功率而给未知对象添加宽松默认尺度。
+
+### 9.2 生成固定组合
+
+```bash
+python -m lightconstruction.cli build-render-jobs \
   --config configs/default.yaml \
-  --allow-partial
+  --annotations data/annotation_construction.json \
+  --output outputs/manifests/render_jobs.jsonl \
+  --seed 20260810
 ```
 
-训练数据正式生产不建议使用 `--allow-partial`。
+输出：
 
-## 6. 主要配置
+- `render_jobs.jsonl`：Blender 直接消费的 job。
+- `render_jobs.summary.json`：输入 digests、统计和完整 job 文档。
+- `render_job_rejects.jsonl`：缺 blend、缺 entity 等拒绝原因。
 
-统一配置位于 `configs/default.yaml`：
+相同输入、配置和 seed 必须产生相同 job ID、target、yaw 和 transform 目标。
 
-- `paths`：输入、缓存、正式输出和 review 文件路径。
-- `object`：预期对象数、类别数和许可证策略。
-- `scene`：Blender 路径/版本、并发数、ID 长度、类别别名、人工 overrides 和抽检比例。
-- `annotation`：vLLM 地址、模型、并发数、重试、置信度阈值和 thinking 开关。
+## 10. M4：组合渲染
 
-类别名称规则在 `configs/category_aliases.yaml` 中维护。修改任何会影响输出语义的配置都会改变 `config_digest`，下游 JSON 同时记录输入文件 digest，便于复现和检查数据是否过期。
+先用小批次设置：
 
-## 7. 输出 JSON 的作用
-
-### `object.json`
-
-保存 80 个对象的 UID、类别、GLB 相对路径、许可证、作者与来源 metadata。它是后续几何归一化和资产加载的索引，不包含已经加载到内存中的几何。
-
-### `scene.json`
-
-保存 scene、mesh node 和逻辑 entity。`node_id` 用于在 `.blend` 中精确查找对象；`entity_id` 用于 LLM 标注以及后续放置/替换。
-
-### `annotation_construction.json`
-
-保存类别级语义判断和展开后的目标 entity ID。该文件只回答“语义上允许放在哪里或替换什么”，不保存本次渲染所选的尺度、位置、相机和灯光。
-
-## 8. A100 和并行建议
-
-- M1 主要是 JSON 处理，不需要 GPU。
-- M2 使用独立 Blender 进程；先用 `--workers 1`，根据系统内存提高到 2。
-- M3 使用单张 A100 部署 vLLM，并通过异步请求提高吞吐；默认 `--concurrency 16`。
-- 不要同时进行大规模 vLLM 标注和 Cycles GPU 渲染。完成 M3 后关闭 vLLM，再把 GPU 交给 Blender。
-- `annotation_cache.jsonl` 是增量缓存，不需要为了重新运行而删除。
-
-## 9. 许可证与数据管理
-
-`object.json` 保留逐对象许可证和作者来源。当前 metadata 中包含 CC0、CC-BY、CC-BY-SA、CC-BY-NC 和 CC-BY-NC-SA 等不同条件；进入训练集前必须根据实际用途设置明确的许可证白名单，不能把所有对象笼统视为同一种许可。
-
-Bistro 的 `LICENSE.txt`、Objaverse metadata 和最终训练样本 manifest 都应随数据版本保留。原始 FBX、GLB、纹理、模型权重、缓存与渲染结果默认不提交 Git。
-
-## 10. 常见问题
-
-### Blender 版本不匹配
-
-程序会拒绝非 4.5.x 版本。请通过 `--blender-bin` 指向服务器上的 Blender 4.5，或修改配置进行仅限诊断的版本兼容实验。
-
-### scene node 能否在 Blend 中找到
-
-可以。遍历 Blender 对象并读取：
-
-```python
-obj.get("lc_scene_object_id")
+```yaml
+m4:
+  max_render_jobs: 8
+  render_gpu_ids: [0]
+  render_workers: 1
+  overwrite: false
+  render:
+    resolution: 256
+    samples: 16
 ```
 
-该值与 `scene.json` 的 `node_id` 对应。`source_fbx_element_id` 当前只是辅助字段，不作为主键。
+运行：
 
-### 为什么不让 LLM 决定位置和尺度
+```bash
+python -m lightconstruction.cli render \
+  --config configs/default.yaml \
+  --blender-bin /opt/blender-4.5/blender \
+  --workers 1
+```
 
-类别关系适合由 LLM 判断；稳定支撑、尺度、朝向和穿模属于几何约束。M4 会用支撑面、OBB、类别尺寸先验和 BVH 碰撞检测完成这些工作。
+正式运行不要使用 `--allow-partial`。失败 job 会进入：
 
-### 为什么没有保存组合后的 Blend
+```text
+outputs/tokenlight_dataset/render_errors.jsonl
+outputs/tokenlight_dataset/render_workers/*/errors.jsonl
+```
 
-M4 计划使用只读 base scene 和长生命周期 Blender worker。每个 job 在内存中临时加入 object、渲染后回滚，默认不保存组合 `.blend`，减少磁盘占用并避免污染基础场景。
+组件目录先写为 `<job_id>.partial`，只有 metadata 完整后才原子改名。`overwrite: false` 会复用已有完整 `metadata.json`，但拒绝覆盖不完整目录；修复原因后应明确清理对应单个 partial job，再重试。
 
-## 11. 后续计划：M4–M5
+## 11. 构建 split 和严格验证
 
-M4 要等训练代码加入仓库后再实现，以便先冻结 Dataset/DataLoader 所需的图像分辨率、条件字段、RGB/depth/normal/mask pass 和 manifest 格式。计划包括：
+编辑 `Lumina-T2X/lumina_next_t2i/config.yaml`，让 TokenLight 指向 M4 输出：
 
-1. 为 80 个 Objaverse 对象缓存规范化几何、稳定姿态、尺度先验、AABB/OBB、凸包和最低接触点。
-2. 从 `annotation_construction.json` 确定性生成 scene-major render jobs。
-3. 每个 scene 启动一个长生命周期 Blender worker，只加载一次 base `.blend`。
-4. 放置任务提取朝上支撑面、采样位置/yaw、匹配尺度并执行 AABB + BVH 碰撞检测。
-5. 替换任务隐藏原 entity 的全部 node，以目标 OBB、底面和主轴匹配新对象。
-6. 在一个组合状态下渲染多角度、多光照及训练需要的辅助 pass。
-7. 每个 job 完成后按 state journal 回滚，并校验 base fingerprint；回滚失败时重载 scene。
-8. 输出可复现的逐样本 manifest，再与训练代码做端到端读取验收。
+```yaml
+paths:
+  dataset_root: /absolute/path/to/outputs/tokenlight_dataset
+  render_output_root: /absolute/path/to/outputs/tokenlight_dataset
+  train_manifest: /absolute/path/to/outputs/tokenlight_dataset/manifests/train.jsonl
+  validation_manifest: /absolute/path/to/outputs/tokenlight_dataset/manifests/validation.jsonl
+  test_manifest: /absolute/path/to/outputs/tokenlight_dataset/manifests/test.jsonl
 
-M4 中规划的 `prepare-geometry`、`build-render-jobs` 和 `render` 命令目前只是 [`plan.md`](plan.md) 中的接口草案，当前 CLI 尚未提供这些命令。训练代码接入并完成 M4 后，将再次更新 README，补齐最终环境锁定、真实渲染命令和训练运行流程。
+data:
+  require_composition_contract: true
+  split_profile: object-held-out
+  tasks: [ambient_scale, global_diffuse, add_light, in_scene_light]
+  task_probabilities:
+    ambient_scale: 0.25
+    global_diffuse: 0.25
+    add_light: 0.25
+    in_scene_light: 0.25
+  inspect_all_tasks: true
+
+model:
+  fixture_mask_enabled: true
+```
+
+在 `Lumina-T2X/` 下运行：
+
+```bash
+python tools/tokenlight_data/build_manifests.py \
+  --config lumina_next_t2i/config.yaml
+
+python tools/tokenlight_data/validate_components.py \
+  --config lumina_next_t2i/config.yaml
+
+python tools/tokenlight_data/inspect_dataset.py \
+  --config lumina_next_t2i/config.yaml
+```
+
+`validate_components.py` 会检查：
+
+- camera/canonical/transform 长度和坐标空间
+- EXR shape、NaN/Inf、point/diffuse/fixture contribution
+- fixture mask 和 `fixture_source`
+- scene-native entity 绑定与 fallback 排他性
+- base scene fingerprint、lineage、许可证政策
+- 配置中的每个任务至少有一个 eligible scene
+- 对应 split profile 的跨 split 交集
+
+`inspect_dataset.py` 使用固定 `(index, sample_seed)` 搜索，必须实际读取并展示所有启用任务；不会再用随机前几个样本冒充任务覆盖。
+
+### 切分语义
+
+- `object-held-out`：同一 `asset_uid` 不跨 split；允许复用 base scene，只能声明对象泛化。
+- `scene-held-out`：同一 `base_scene_id` 不跨 split；至少需要三个不同 base scene。场景不足时直接失败。
+
+每次构建还会写 `dataset_release.json`，保存 split、fixture 来源、许可证政策、lineage digest 和三个 manifest digest。
+
+## 12. 固定 manifest 训练 smoke
+
+Dataset 可读不等于训练可用。任何数据版本在两阶段 smoke 完成前都不是 `train-ready`。
+
+### 12.1 Smoke 配置
+
+复制正式配置为服务器本地 smoke 配置，并显式修改：
+
+```yaml
+paths:
+  upstream_checkpoint: /path/to/Lumina-Next-T2I/consolidated_ema.00-of-01.safetensors
+  vae: /path/to/sdxl-vae
+  dataset_root: /path/to/fixed-small-tokenlight-dataset
+  train_manifest: /path/to/fixed-small-tokenlight-dataset/manifests/train.jsonl
+  validation_manifest: /path/to/fixed-small-tokenlight-dataset/manifests/validation.jsonl
+  output_root: /path/to/smoke-outputs
+  resume_checkpoint: null
+
+data:
+  num_workers: 0
+  tasks: [ambient_scale, global_diffuse, add_light, in_scene_light]
+
+train:
+  micro_batch_size: 1
+  gradient_accumulation_steps: <fixed schedule large enough to cover all tasks>
+  max_steps: <small positive number>
+  checkpoint_every_steps: 1
+  smoke:
+    enabled: true
+    required_tasks: [ambient_scale, global_diffuse, add_light, in_scene_light]
+    summary_json: smoke_summary.json
+
+logging:
+  run_id: tokenlight_fixed_smoke_v1
+
+runtime:
+  gpu_ids: [0]
+```
+
+Smoke 强制单进程、单 GPU、`num_workers: 0`，并要求固定 sampler 序列覆盖所有启用任务。
+
+### 12.2 第一阶段
+
+在 `Lumina-T2X/` 下仍使用正式训练入口：
+
+```bash
+python lumina_next_t2i/train_tokenlight.py \
+  --config /path/to/tokenlight_smoke.yaml
+```
+
+第一阶段必须完成：
+
+- forward、backward 和至少一次 optimizer update
+- optimizer state 的 step 在 `optimizer.step()` 前后实际递增
+- finite `loss_total`、逐任务 loss 和 grad norm
+- 有效 lighting token 进入模型
+- `in_scene_light` 的 fixture mask 非空并进入模型
+- 保存模型、optimizer、RNG、dataloader state 和 checkpoint index
+
+成功后 `smoke_summary.json` 必须是：
+
+```json
+{"status": "awaiting-resume", "train_ready": false}
+```
+
+这不是最终通过状态。
+
+### 12.3 第二阶段恢复
+
+保持相同 manifest、seed、任务、任务概率、batch 和 optimizer 语义，只修改：
+
+```yaml
+paths:
+  resume_checkpoint: /path/to/smoke-outputs/tokenlight_fixed_smoke_v1/checkpoints/step_XXXXXXXXX
+
+train:
+  max_steps: <大于第一阶段 global_step>
+```
+
+再次运行同一个入口：
+
+```bash
+python lumina_next_t2i/train_tokenlight.py \
+  --config /path/to/tokenlight_smoke.yaml
+```
+
+恢复门会检查：
+
+- checkpoint 正是第一阶段 summary 记录的 checkpoint
+- `global_step`、`samples_seen` 和 optimizer state 已恢复
+- manifest SHA256 与 resume signature 一致
+- 恢复后的第一个 `(sample_index, sample_seed)` 是未消费的下一项
+- 恢复后能继续完成有限 loss 的 optimizer update
+
+全部通过后才会写：
+
+```json
+{"status": "pass", "train_ready": true, "resume_verified": true}
+```
+
+任一失败只会写 `train_ready: false` 或不产生通过结果，旧数据版本的 summary 不能复用。
+
+## 13. 正式训练与评测
+
+Smoke 通过后，恢复正式 `max_steps`、worker、DDP 和独立 `logging.run_id`。正式训练第一次从上游 Lumina 权重开始：
+
+```yaml
+paths:
+  resume_checkpoint: null
+
+train:
+  smoke:
+    enabled: false
+```
+
+单卡入口：
+
+```bash
+python lumina_next_t2i/train_tokenlight.py \
+  --config lumina_next_t2i/config.yaml
+```
+
+项目封装的 DDP 入口：
+
+```bash
+bash lumina_next_t2i/train.sh
+```
+
+正式恢复只能使用相同数据与训练签名的 TokenLight checkpoint。修改 manifest、任务、概率、resolution、batch、world size 或 lighting/flow 配置后，应开始新 run。
+
+评测：
+
+```bash
+python lumina_next_t2i/evaluate_tokenlight.py \
+  --config lumina_next_t2i/config.yaml
+```
+
+当前入口提供按任务汇总的 PSNR、SSIM 和可选 LPIPS。它们不能替代位置轨迹、强度单调性、颜色误差和 mask 局部性评测；这些控制性指标需要固定 sweep 后才能声称模型学会可控光照。
+
+## 14. 测试命令
+
+以下命令用于服务器或具备对应依赖的开发环境。生成数据和训练前应依次执行，但本仓库不会在缺少用户 GPU、checkpoint 和真实 manifest 时伪造通过结果。
+
+LightConstruction 单元测试：
+
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+TokenLight smoke gate 单元测试：
+
+```bash
+python -m unittest discover -s Lumina-T2X/tests -p "test_*.py"
+```
+
+Python 语法检查：
+
+```bash
+python -m compileall src scripts Lumina-T2X/lumina_next_t2i Lumina-T2X/tools
+```
+
+真实 Blender 小批次、组件 validator、全任务 Dataset inspection 和两阶段训练 smoke 是发布前必须保留输出的集成测试，不能由单元测试代替。
+
+## 15. 常见阻断条件
+
+### 全部对象进入 quarantine
+
+检查：
+
+- `OBJECT_ROOT` 是否指向真实 Objaverse 根目录
+- `category_dimensions.yaml` 是否覆盖实际类别
+- `object.license_allowlist` 是否使用 `object.json` 中的规范名称
+- object override 是否意外设置 `disabled: true`
+
+### render job 为零
+
+检查 annotation digest 是否过期、对象类别是否存在 targets、scene entity 是否仍存在、归一化 blend 是否在配置路径中。
+
+### 所有 fixture 都进入 fallback
+
+检查 `m4.fixture_categories` 是否覆盖 scene category、真实灯具 entity 是否在固定相机视锥内，以及可见像素是否超过阈值。不要通过无条件降低阈值把遮挡或出视锥灯具标记为真实 fixture。
+
+### 环境光双计数
+
+point、diffuse 和 fixture component 必须在 World strength 为零时渲染。若修改 renderer，重新检查 `component - dark`，不能把 ambient 包进 component。
+
+### Validator 报 split leakage
+
+确认 `data.split_profile` 与要声明的泛化轴一致。只有少量 Bistro scene 时应使用并明确标注 `object-held-out`，不能声称 scene generalization。
+
+### Smoke 无法覆盖全部任务
+
+固定 sampler 序列没有采到所有任务。增加固定 manifest 的有效组件、提高 smoke 样本数或更换 seed，然后冻结新的 manifest/seed；不能删除任务覆盖断言。
+
+### Resume 被拒绝
+
+这是安全行为。检查 manifest digest、任务和概率、batch、world size、lighting/flow 配置以及 checkpoint 是否来自同一个 smoke run。
+
+## 16. 可声明结果的边界
+
+完成本 README 的数据链路和 smoke 后，可以声明：
+
+- annotation 能确定性地产生 TokenLight 组合样本
+- 数据满足 reader、分量、坐标、fixture、split、lineage 和许可证技术契约
+- 固定小 manifest 能执行训练更新并精确恢复
+
+仍不能仅据此声明：
+
+- 数据分布足以代表所有对象、场景或真实图像域
+- 模型已学会位置、强度、颜色和 fixture 局部控制
+- 数据、checkpoint 或生成结果已获得特定用途的法律批准
+- 小批次通过等价于大规模渲染稳定
+
+这些结论需要代表性覆盖报告、规模化 soak、固定控制评测和责任方批准。

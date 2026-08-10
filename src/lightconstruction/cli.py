@@ -8,8 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config
+from .geometry_prepare import prepare_geometry
 from .llm_annotate import annotate_construction
 from .object_index import prepare_objects
+from .render_compositions import render_compositions
+from .render_jobs import build_render_jobs
 from .scene_extract import prepare_scenes
 
 
@@ -53,6 +56,28 @@ def main(argv: list[str] | None = None) -> None:
         )
         _print_summary("annotation", result)
         return
+    if args.command == "prepare-geometry":
+        result = prepare_geometry(config)
+        _print_summary("prepared_geometry", result)
+        return
+    if args.command == "build-render-jobs":
+        result = build_render_jobs(
+            config,
+            annotations_path=Path(args.annotations).resolve() if args.annotations else None,
+            output_path=Path(args.output).resolve() if args.output else None,
+            seed=args.seed,
+        )
+        _print_summary("render_jobs", result)
+        return
+    if args.command == "render":
+        result = render_compositions(
+            config,
+            blender_bin=args.blender_bin,
+            workers=args.workers,
+            allow_partial=args.allow_partial,
+        )
+        _print_summary("render", result)
+        return
     parser.error(f"Unsupported command: {args.command}")
 
 
@@ -85,6 +110,26 @@ def _build_parser() -> argparse.ArgumentParser:
     annotate.add_argument("--concurrency", type=int, default=None)
     annotate.add_argument("--allow-partial", action="store_true", default=None)
     annotate.add_argument("--resume", action="store_true", help="Accepted for command compatibility; cache reuse is automatic")
+
+    geometry = subparsers.add_parser(
+        "prepare-geometry", help="Validate object scale/orientation contracts for M4"
+    )
+    _common_arguments(geometry)
+    geometry.add_argument("--workers", type=int, default=None, help="Reserved for Blender geometry caching")
+
+    jobs = subparsers.add_parser(
+        "build-render-jobs", help="Build deterministic object-scene composition jobs"
+    )
+    _common_arguments(jobs)
+    jobs.add_argument("--annotations", default=None)
+    jobs.add_argument("--output", default=None)
+    jobs.add_argument("--seed", type=int, default=None)
+
+    render = subparsers.add_parser("render", help="Render TokenLight components from composition jobs")
+    _common_arguments(render)
+    render.add_argument("--blender-bin", default=None)
+    render.add_argument("--workers", type=int, default=None)
+    render.add_argument("--allow-partial", action="store_true")
     return parser
 
 

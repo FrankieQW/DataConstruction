@@ -1,8 +1,8 @@
 # LightConstruction 数据合成项目实施计划
 
-> 状态：M0–M3 代码已于 2026-08-10 落地；目标服务器上的数据生成与人工验收待执行，终点是生成并验收 `data/annotation_construction.json`。M4 及之后仅保留为后续计划，等待训练代码进入仓库后再联合适配。本文不运行测试、不提交 Git。
+> 状态：M0–M5 的代码入口已于 2026-08-10 组合完成；目标服务器上的真实数据生成、Blender 小批次、人工验收以及固定 manifest 两阶段训练 smoke 尚未执行。M4/M5 的最终实现与门槛以 `TOKENLIGHT_ADAPTATION_IMPLEMENTATION_PLAN.md` 和根目录 `README.md` 为准。本文不代表测试已经运行，也不包含 Git 操作。
 
-当前实现入口为 `python -m lightconstruction.cli`，包含 `prepare-objects`、`prepare-scenes` 和 `annotate-construction` 三个子命令。配置、schema、断点缓存、原子写入、Blender 回定位属性、scene 人工抽检报告和 LLM review queue 均已实现；正式 JSON 不在缺少 Blender 4.5 或存在未解决 LLM 请求时降级生成。
+当前实现入口为 `python -m lightconstruction.cli`，包含 `prepare-objects`、`prepare-scenes`、`annotate-construction`、`prepare-geometry`、`build-render-jobs` 和 `render`。配置、schema、断点缓存、原子写入、Blender 回定位属性、scene 人工抽检报告、LLM review queue、组合渲染、TokenLight 数据验证与训练 smoke 门均已接通；真实服务器验收仍由操作者执行。
 
 ## 1. 目标与本阶段边界
 
@@ -12,10 +12,10 @@
 
 1. **当前范围 M0–M2——数据处理**：生成 `data/object/object.json`、`data/scene/scene.json` 和一次性归一化场景缓存。
 2. **当前范围 M3——预组合标注**：按类别而非逐资产调用本地 LLM，生成 `data/annotation_construction.json`；该文件通过验收即结束当前阶段。
-3. **后续范围 M4——训练前即时组合与渲染**：等待训练代码加入后，根据其 Dataset/DataLoader、条件字段、图像输出和批处理方式适配；当前只保留设计，不实现代码、不生成 render jobs。
-4. **贯穿范围 M5——README 与端到端说明**：当前先提供覆盖 M0–M3、整体架构和 M4 后续计划的中文 README；待 M4 与训练接口稳定后，再补齐真实渲染、训练和最终验收命令。
+3. **M4——训练前组合与渲染**：根据冻结的 annotation、geometry contract 和场景 entity 生成确定性 render jobs，再由 Blender 输出 TokenLight 线性分量。
+4. **M5——验证、训练门与文档**：完成 composition contract、split/lineage/license 验证、全任务 Dataset inspection、两阶段训练 smoke 和端到端 README。
 
-M1、M2 应先完成并人工抽查，再进入 M3。否则 scene 类别或逻辑实体划分一旦变化，annotation 会整体失效。当前阶段不实现组合、碰撞、相机、灯光或渲染 worker。
+M1、M2 应先完成并人工抽查，再进入 M3。否则 scene 类别或逻辑实体划分一旦变化，annotation 会整体失效。M4 会拒绝 stale digest，并对组合可见性、非目标几何相交、相机、受控灯光和 worker 隔离进行检查。
 
 ## 2. 已核验的现有数据
 
@@ -389,7 +389,7 @@ python -m lightconstruction.cli annotate-construction \
 
 验收：成功生成唯一正式产物 `data/annotation_construction.json`；每个 object 类别有目标集合或明确的空集合；所有目标 ID 存在于 `scene.json`；文件记录 object/scene digest、模型、prompt 版本和统计；相同输入重复运行结果稳定；低置信与失败项均进入 review queue，没有未经记录的默认兜底。通过这些检查即视为当前 M0–M3 阶段完成。
 
-### M4：几何预处理与渲染时即时组合（后续计划，当前不实施）
+### M4：几何预处理与渲染时组合（代码已组合，真实数据待验收）
 
 启动条件：用户将训练代码放入仓库，并能够读取其 Dataset/DataLoader、训练条件、样本 manifest、图像/辅助 pass 格式和并行方式。在此之前，本节命令与接口均为设计草案，不创建对应实现，避免先做出的渲染数据结构与训练管线不匹配。
 
@@ -458,9 +458,9 @@ outputs/reports/render_summary.json
 
 验收：每个 job 都从未修改的 base scene 开始；输出 manifest 可以单独复现组合和渲染；目标可回定位；放置物体有足够支撑且无超过阈值的穿透；替换物体尺度不过度失真；所有失败均有机器可读原因；base `.blend` 的 digest 在渲染前后保持不变。
 
-### M5：中文 README（基础版已完成，后续随 M4 更新）
+### M5：中文 README 与最终训练验收门（代码和文档已组合，服务器验收待执行）
 
-当前 `README.md` 已包含项目目标、目录结构、数据准备、两套 conda 环境、Blender 安装与版本检查、M0–M3 完整命令、断点续跑、输出 JSON 说明、并行参数、A100 资源分配、常见错误、许可证注意事项和 M4 后续计划。M4 与训练代码完成适配后，再把设计草案替换成已经验证的渲染和训练命令。
+当前 `README.md` 已包含项目目标、目录结构、数据准备、环境、M1–M4 完整命令、TokenLight 组件验证、split、固定 manifest 两阶段训练 smoke、正式训练与测试命令。命令已写入并不等于真实服务器验收已经通过。
 
 ## 7. 环境配置建议
 

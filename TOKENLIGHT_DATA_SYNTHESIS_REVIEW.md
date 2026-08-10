@@ -209,7 +209,23 @@ components/<composition_id>/
 
 ### 关于 `in_scene_light`
 
-`annotation_construction.json` 不包含灯具 mesh、灯光绑定或 mask，所以它本身不能生成 `in_scene_light` 数据。
+`annotation_construction.json` 不包含灯具 mesh、灯光绑定或 mask，所以它本身不能单独决定 `in_scene_light` 使用哪一盏灯。灯具选择应在 object/scene 组合完成并固定相机之后进行，采用“真实灯具优先、程序化灯具兜底”的策略：
+
+```text
+当前组合和相机视野内是否存在可用的真实灯具？
+├─ 是：使用真实灯具，不创建球形 fixture
+└─ 否：创建人工球形 fixture，保证该样本仍支持 in_scene_light
+```
+
+这里“可用的真实灯具”必须同时满足：
+
+- 灯具 mesh 在当前相机视野内可见；
+- 能生成准确的 fixture mask；
+- 能绑定已有解析光源，或根据场景语义创建对应的可控解析光源；
+- 能控制对应 emission 和解析光源的开关；
+- 开启后产生非零、不过曝的独立光照贡献。
+
+不能只根据名称中包含 `lamp`、`light` 等词就把 entity 当作可用真实灯具。若无法建立可靠的 `fixture mesh ↔ analytic light ↔ emissive material` 绑定，则该候选不作为真实灯具使用，继续进入程序化 fixture 兜底路径。
 
 你当前配置实际上启用了：
 
@@ -217,20 +233,57 @@ components/<composition_id>/
 - `fixture_mask_enabled: true`
 - `in_scene_lights_per_scene: 1`
 
-见 [config.yaml](Lumina-T2X/lumina_next_t2i/config.yaml#L29)。现有 renderer 会人为添加球形 fixture，这不是 Bistro 场景中的真实灯具。如果这一批数据的目标主要是 scene/object 合成，第一版建议先生成：
+见 [config.yaml](Lumina-T2X/lumina_next_t2i/config.yaml#L29)。现有 renderer 会人为添加球形 fixture。组合场景 renderer 不应无条件添加球形 fixture，而应按以下顺序调度：
 
-```yaml
-data:
-  tasks: [ambient_scale, global_diffuse, add_light]
+1. 完成 object 的放置或替换，并固定组合状态与相机。
+2. 在当前相机视锥内查找可见的真实灯具 entity。
+3. 对候选灯具建立 mesh、解析光源、emission 和 mask 的绑定并检查独立光照贡献。
+4. 若存在合格真实灯具，选取真实灯具，不创建人工 fixture。
+5. 若不存在合格真实灯具，在无碰撞、可见且不过度遮挡的位置创建球形 fixture。
+6. 对最终选定的灯具渲染关闭状态、开启分量和 mask。
+7. metadata 记录灯具来源、真实 entity 或程序化参数、光源参数和随机 seed。
 
-model:
-  fixture_mask_enabled: false
+两种来源使用相同的 TokenLight `path`/`mask` 消费契约，但必须明确记录来源。真实场景灯具示例：
 
-render:
-  in_scene_lights_per_scene: 0
+```json
+{
+  "fixture_source": "scene_native",
+  "fixture_entity_id": "bistro:entity:lamp_001",
+  "fixture_node_ids": ["bistro:node:lamp_mesh"],
+  "light_object_ids": ["BistroPointLight_001"],
+  "path": "components/.../fixture_000_on.exr",
+  "mask": "components/.../fixture_000_mask.png",
+  "base_energy": 300.0,
+  "emission_strength": 4.0
+}
 ```
 
-等后续建立“灯具 entity → light source → fixture mask”的可靠绑定后，再单独启用 `in_scene_light`。
+程序化兜底灯具示例：
+
+```json
+{
+  "fixture_source": "procedural_fallback",
+  "fixture_entity_id": null,
+  "path": "components/.../fixture_000_on.exr",
+  "mask": "components/.../fixture_000_mask.png",
+  "position": [0.2, 0.4, 1.5],
+  "base_energy": 300.0,
+  "fixture_size": 0.08,
+  "seed": 202608100001
+}
+```
+
+两种来源都必须保持 fixture 几何在 source/target 中位置和轮廓不变，并按照当前 Dataset 公式生成分量：
+
+```text
+contribution = max(fixture_on - dark, 0)
+source       = ambient
+target       = ambient + contribution * color * intensity * transition
+```
+
+不得在已经选中真实灯具的样本中再添加球形 fixture。程序化 fixture 还必须通过碰撞、相机可见性、遮挡比例和画面占比检查，不能生成在墙内、物体内部或画面外。
+
+当前 `TokenLightDataset` 可以同时消费两种来源，因为它读取相同的 `path` 和 `mask` 字段。数据检查与评测则应按 `fixture_source` 分别统计 `scene_native` 和 `procedural_fallback` 的样本量与指标，避免大量简单的球形 fixture 掩盖模型在真实场景灯具上的效果。正式 manifest 还应记录两种来源的目标配额或实际占比。
 
 所以你接下来的实际开发目标不是“转换 JSON 格式”，而是新增两个阶段：
 
