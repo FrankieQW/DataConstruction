@@ -1,0 +1,180 @@
+# TokenLight-Lumina 的唯一持久配置入口。
+# 权重下载位置和完整流程见 TOKENLIGHT_GUIDE.md。
+paths:
+  upstream_checkpoint: /mnt/afs_fangwenqi/models/tokenlight/Lumina-Next-T2I/consolidated_ema.00-of-01.safetensors
+  vae: /mnt/afs_fangwenqi/models/tokenlight/sdxl-vae/
+  gemma: /mnt/afs_fangwenqi/models/tokenlight/gemma-2b  # 仅原始 T2I 基线使用
+  dataset_root: /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene
+  train_manifest:  /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene/manifests/train.jsonl
+  validation_manifest: /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene/manifests/validation.jsonl
+  test_manifest: /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene/manifests/test.jsonl
+  object_root: /mnt/afs_fangwenqi/data/Objaverse
+  hdri_root: /mnt/afs_fangwenqi/data/polyhaven_hdri
+  render_output_root: /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene
+  output_root: /mnt/afs_fangwenqi/Lumina-T2X/outputs/tokenlight
+  resume_checkpoint: null
+  inference_checkpoint: null
+
+data:
+  resolution: 960
+  require_composition_contract: true
+  split_profile: object-held-out
+  crop_mode: center
+  exposure: 1.0
+  tone_mapping: reinhard
+  num_workers: 4
+  pin_memory: true
+  samples_per_scene_train: 64
+  samples_per_scene_validation: 8
+  deterministic_validation: true
+  validation_seed: 12345
+  tasks: [ambient_scale, global_diffuse, add_light,in_scene_light]
+  task_probabilities:
+    ambient_scale: 0.25
+    global_diffuse: 0.25
+    add_light: 0.25
+    in_scene_light: 0.25
+  inspect_samples: 2
+  inspect_all_tasks: true
+  inspect_seed_search_limit: 4096
+  inspect_output: dataset_inspection
+
+model:
+  name: NextDiT_2B_GQA_patch2
+  latent_channels: 4
+  patch_size: 2
+  dim: 2304
+  layers: 24
+  heads: 32
+  kv_heads: 8
+  multiple_of: 256
+  ffn_dim_multiplier: null
+  norm_epsilon: 0.00001
+  qk_norm: true
+  learn_sigma: true
+  cap_feat_dim: 2048
+  rope_max_size: 384
+  max_lights: 3
+  fixture_mask_enabled: true
+  fixture_mask_patch_size: 2
+
+lighting:
+  fourier_features: 32
+  fourier_sigma: 5.0
+  fourier_seed: 0
+  cfg_dropout: 0.1
+  ambient_scale_range: [0.0, 1.5]
+  light_color_range: [0.2, 1.0]
+  light_intensity_range: [0.1, 1.5]
+  fixture_intensity_range: [0.0, 1.5]
+  fixture_transition_range: [0.0, 1.0]
+
+flow:
+  path: linear
+  prediction: velocity
+  time_min: 0.0
+  time_max: 1.0
+  loss: mse
+
+train:
+  seed: 42
+  precision: bf16
+  micro_batch_size: 1
+  gradient_accumulation_steps: 20
+  max_steps: 15000
+  learning_rate: 0.00001
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  gradient_clip_norm: 1.0
+  vae_scale: 0.13025
+  vae_shift: 0.0
+  validation_every_steps: 250
+  validation_batches: 32
+  checkpoint_every_steps: 500
+  smoke:
+    enabled: false
+    required_tasks: [ambient_scale, global_diffuse, add_light, in_scene_light]
+    summary_json: smoke_summary.json
+
+infer:
+  seed: 42
+  steps: 50
+  solver: euler
+  cfg_scale: 2.0
+  precision: bf16
+  vae_scale: 0.13025
+  vae_shift: 0.0
+  save_metadata: true
+
+evaluate:
+  split: test
+  batch_size: 1
+  seed: 12345
+  max_samples: 16
+  metrics: [psnr, ssim,lpips]
+  lpips_network: alex
+  output_directory: test
+  save_images: false
+
+logging:
+  run_id: tokenlight_1000obj_960_in_scene
+  log_every_steps: 10
+  tensorboard: true
+  train_jsonl: train.jsonl
+  validation_jsonl: validation.jsonl
+  checkpoint_index_jsonl: checkpoints/index.jsonl
+
+runtime:
+  device: cuda
+  gpu_ids:  [0, 1, 2, 3, 4, 5, 6, 7]
+  model_parallel_size: 1
+  flash_attention: true
+  activation_checkpointing: false
+
+render:
+  blender_executable: /mnt/afs_fangwenqi/blender/blender
+  gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+  workers_per_gpu: 4
+  threads_per_worker: auto
+  resolution: 960
+  engine: CYCLES
+  samples: 64
+  denoise: true
+  persistent_data: true
+  mask_samples: 1
+  device: GPU
+  compute_device_type: CUDA
+  views_per_asset: 2
+  point_lights_per_scene: 64
+  point_light_base_energy: 500.0
+  diffuse_sizes: [0.05, 0.2, 0.4, 0.7, 1.0, 1.5]
+  point_light_radius_range: [0.03, 0.25]
+  light_position_ranges:
+    x: [-1.2, 1.2]
+    y: [-0.6, 1.2]
+    z: [0.15, 1.8]
+  diffuse_light_position: [0.0, 0.3, 1.3]
+  in_scene_lights_per_scene: 1
+  in_scene_light_energy: 300.0
+  in_scene_light_radius: 0.12
+  in_scene_fixture_size: 0.08
+  in_scene_emission_strength: 4.0
+  in_scene_position_ranges:
+    x: [-0.8, 0.8]
+    y: [-0.6, -0.1]
+    z: [0.4, 1.2]
+  canonical_size: 1.5
+  ground_size: 8.0
+  stage_color: [0.18, 0.18, 0.18, 1.0]
+  add_back_wall: true
+  camera_distance: 3.5
+  camera_yaw_degrees: [-20.0, 20.0]
+  camera_pitch_degrees: [5.0, 25.0]
+  camera_target_height: 0.65
+  camera_focal_length: 50.0
+  train_fraction: 0.8
+  validation_fraction: 0.1
+  test_fraction: 0.1
+  split_seed: 42
+  asset_limit: 1000
+  overwrite: false
