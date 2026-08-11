@@ -11,7 +11,7 @@ from .config import load_config
 from .geometry_prepare import prepare_geometry
 from .llm_annotate import annotate_construction
 from .object_index import prepare_objects
-from .render_compositions import render_compositions
+from .render_compositions import clear_render_partial, render_compositions
 from .render_jobs import build_render_jobs
 from .scene_extract import prepare_scenes
 
@@ -78,6 +78,10 @@ def main(argv: list[str] | None = None) -> None:
         )
         _print_summary("render", result)
         return
+    if args.command == "clear-render-partial":
+        result = clear_render_partial(config, job_id=args.job_id)
+        _print_summary("render_partial", result)
+        return
     parser.error(f"Unsupported command: {args.command}")
 
 
@@ -130,6 +134,13 @@ def _build_parser() -> argparse.ArgumentParser:
     render.add_argument("--blender-bin", default=None)
     render.add_argument("--workers", type=int, default=None)
     render.add_argument("--allow-partial", action="store_true")
+
+    clear_partial = subparsers.add_parser(
+        "clear-render-partial",
+        help="Explicitly clear one failed render partial after reviewing failure.json",
+    )
+    _common_arguments(clear_partial)
+    clear_partial.add_argument("--job-id", required=True)
     return parser
 
 

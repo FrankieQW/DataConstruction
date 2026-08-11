@@ -92,7 +92,7 @@ lightconstruction render
 - 解析 place/replace
 - 确定目标实体
 - 生成固定且可复现的组合 transform
-- 选择固定相机
+- 忽略原 scene 相机，围绕组合区域选择固定且可复现的自建相机
 - 生成确定性 `job_id`
 - 写出 `render_jobs.jsonl`
 
@@ -115,7 +115,7 @@ lightconstruction render
 
 1. 加载 Bistro `.blend`
 2. 记录基础场景 fingerprint
-3. 固定相机
+3. 围绕最终插入对象创建 composition camera；目标允许偏离画面中心，但必须通过对象、target/contact 可见性和无裁切门
 4. 执行 place 或 replace
 5. 检查对象可见性、碰撞和接触关系
 6. 渲染 TokenLight 分量

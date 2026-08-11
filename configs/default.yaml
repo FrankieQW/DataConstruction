@@ -108,9 +108,20 @@ m4:
   relation_priority: [replace, place_on]
   replacement_fill_ratio: 0.90
   yaw_degrees: [0, 90, 180, 270]
-  camera_strategy: existing_or_target_framed
+  # Formal composition renders always create a camera around the inserted object.
+  # Cameras stored in the source scene are ignored.
+  camera_strategy: generated_target_visible
   camera_focal_length: 50.0
-  camera_distance_scale: 3.0
+  camera_candidate_count: 24
+  camera_azimuth_degrees: [0, 45, 90, 135, 180, 225, 270, 315]
+  camera_elevation_degrees: [15, 25, 35, 45]
+  camera_subject_fill_range: [0.25, 0.60]
+  camera_shift_x_range: [-0.18, 0.18]
+  camera_shift_y_range: [-0.15, 0.15]
+  camera_ndc_x_range: [0.15, 0.85]
+  camera_ndc_y_range: [0.15, 0.85]
+  camera_edge_margin: 0.02
+  camera_target_minimum_visible_pixels: 64
   fixture_categories: [lamp, lantern, light, chandelier, sconce]
   scene_render_overrides: {}
   max_render_jobs: null
@@ -146,8 +157,13 @@ m4:
     require_verified_license: true
   fixture:
     minimum_visible_pixels: 64
-    fallback_fixture_size: 0.08
+    fallback_position_mode: subject_relative
+    fallback_candidates: 12
+    fallback_fixture_size_ratio: 0.12
+    fallback_fixture_size_min: 0.01
+    fallback_fixture_size_max: 0.08
+    # Values are multiplied by the inserted object's maximum world dimension.
     fallback_position_ranges:
-      x: [-0.8, 0.8]
-      y: [-0.6, -0.1]
-      z: [0.4, 1.2]
+      x: [-1.5, 1.5]
+      y: [-1.0, -0.2]
+      z: [0.8, 2.0]

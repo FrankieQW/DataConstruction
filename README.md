@@ -56,6 +56,14 @@ object.json + scene.json ── annotate-construction
 - replace 隐藏目标 entity 对应的 mesh，将对象按目标包围盒进行 uniform fit。
 - 每个 Blender job 都重新打开只读 base `.blend`，不会把上一个样本的状态带入下一个样本。
 
+### 自建 composition camera
+
+- 正式路径完全忽略原 scene 的相机；每个 job 都创建独立的 `LC_CompositionCamera`。
+- 相机围绕最终插入对象中心采样方位、俯仰、距离和小幅画面偏移，因此目标不必固定在画面正中心。
+- `replace` 要求原 target 中心仍在视锥内；`place_on` 要求对象与 support 的接触区域在视锥内，并要求 support mesh 有实际可见像素，但不强制整张大型支撑物入镜。
+- 候选相机必须同时通过主体占比、NDC 边界、无裁切、正深度、插入对象 mask 和 target/support mask 门；第一个合格候选被固定到 metadata。
+- 相机确定后才建立 canonical 坐标和采样 point/diffuse/fixture 灯光，保证 lighting token 与实际画面一致。
+
 ### `in_scene_light`
 
 固定组合和相机以后执行 real-first/fallback：
@@ -68,7 +76,9 @@ object.json + scene.json ── annotate-construction
    - 使用真实灯具 mesh 作为 fixture
    - 不创建程序化球体
 5. 没有合格候选时：
-   - 创建球形 fixture
+   - 围绕插入对象按其 world 尺度采样多个球形 fixture 候选
+   - 球体大小也按对象尺度计算并限制最小/最大值，避免小物体使用过大的固定球体
+   - 只有通过最终自建相机的视锥和可见像素门后才接受
    - `fixture_source: procedural_fallback`
 
 两种来源都使用受控点光产生独立 `_on.exr`，但 mask 覆盖的几何来源不同。最终统计必须分别报告二者数量。
@@ -164,6 +174,158 @@ pip install -e .
 ## 5. 正式运行前必须填写的配置
 
 代码会拒绝猜测对象尺度和许可证。以下配置为空时不能进入正式 M4。
+
+### 第二阶段自动运行脚本（不包含 Stage 1）
+
+仓库提供 [`scripts/run_stage2.sh`](scripts/run_stage2.sh)，用于从 object/scene 预处理一直执行到组合渲染、数据门、固定-manifest smoke、8 卡正式训练和评估。它**不会生成 Stage 1 简易数据，也不会训练 Stage 1**；选定的 Stage 1 TokenLight checkpoint 是操作者提供给 Stage 2 的只读输入。
+
+先建立服务器参数文件：
+
+```bash
+cp scripts/stage2.env.example scripts/stage2.env
+vim scripts/stage2.env
+```
+
+必须填写实际 `OBJECT_ROOT`、Blender、Stage 1 checkpoint、VAE、许可证政策和 GPU 编号。包含空格的值必须像模板中的 attribution 一样加引号。模板默认正式训练使用 8×A100、BF16、micro batch 1、gradient accumulation 4，因此 global batch 为 32，并开启 activation checkpointing。
+
+在仓库根目录按需执行：
+
+| 命令 | 执行范围 |
+|---|---|
+| `bash scripts/run_stage2.sh data` | M1 object、M2 scene、M3 annotation、M4 组合渲染、manifest、组件验证和 Dataset inspection |
+| `bash scripts/run_stage2.sh tests` | 运行 LightConstruction 与 Lumina-T2X 的仓库级单元检查 |
+| `bash scripts/run_stage2.sh smoke` | 自动选择固定小 manifest，单卡执行 forward/backward/update/checkpoint 和第二段精确恢复 |
+| `bash scripts/run_stage2.sh train` | smoke 与数据摘要仍匹配后，启动单机 8 卡 Stage 2 DDP 正式训练 |
+| `bash scripts/run_stage2.sh eval` | 使用 `EVAL_CHECKPOINT`，或自动选择正式 run 中最新 checkpoint，在单卡评估 |
+| `bash scripts/run_stage2.sh all` | 依次执行 data、tests、smoke、train 和 eval |
+
+已有且 digest 仍有效的 `data/annotation_construction.json` 可通过 `REUSE_ANNOTATION=true` 复用。需要重新标注时，可以先自行启动 vLLM；也可以设置 `START_VLLM=true`，让脚本启动并在标注结束后关闭它。正式渲染不使用 `--allow-partial`，每个 render worker 只启动一次 Blender 并连续消费分配给它的 job；`RENDER_PERSISTENT_DATA=true` 同时启用 Cycles persistent data。
+
+脚本根据模板生成以下运行时文件，不需要手工修改：
+
+```text
+outputs/stage2_runtime/project.yaml
+outputs/stage2_runtime/tokenlight_stage2.yaml
+outputs/stage2_runtime/tokenlight_smoke_phase1.yaml
+outputs/stage2_runtime/tokenlight_smoke_phase2.yaml
+outputs/stage2_runtime/tokenlight_evaluate.yaml
+```
+
+`train` 会拒绝以下情况：smoke 未通过、checkpoint resume 未验证、完整 train/validation manifest 或 `dataset_release.json` 在 smoke 后变化、8 卡列表数量不等于 8，或者未设置 resume 却复用了已有正式 run 目录。正式断点续训时填写 `FORMAL_RESUME_CHECKPOINT`，并保持原来的8卡 world size和训练签名。
+
+#### 首次运行指南
+
+脚本面向 Linux 服务器，并假定 LightConstruction 与 Lumina-T2X 的依赖已经安装在同一个可用 Python 环境中。建议不要第一次就执行 `all`；先分段确认产物，可以更快定位路径、许可证、Blender、数据和显存问题。
+
+1. 进入训练环境并检查基础程序：
+
+   ```bash
+   cd /path/to/lightconstruction
+   conda activate tokenlight
+   python -c "import torch; print(torch.__version__, torch.cuda.device_count())"
+   python -c "import flash_attn, diffusers, fairscale, cv2, yaml; print('dependencies ok')"
+   /opt/blender-4.5/blender --version
+   nvidia-smi
+   ```
+
+2. 复制参数模板并填写服务器实际值：
+
+   ```bash
+   cp scripts/stage2.env.example scripts/stage2.env
+   vim scripts/stage2.env
+   ```
+
+   最少需要确认：
+
+   | 参数 | 含义 |
+   |---|---|
+   | `PYTHON_BIN` | 当前 TokenLight 环境的 Python，可填写绝对路径 |
+   | `BLENDER_BIN` | Blender 4.5 可执行文件 |
+   | `OBJECT_ROOT` | Objaverse canonical asset 根目录 |
+   | `STAGE1_CHECKPOINT` | 已完成的 Stage 1 TokenLight checkpoint 目录；脚本不会生成它 |
+   | `VAE_PATH` | SDXL VAE 目录 |
+   | `OBJECT_LICENSE_ALLOWLIST` | 与 `object.json` 一致的规范许可证名，逗号分隔 |
+   | `BASE_SCENE_*` | Bistro 来源、署名和已审核的许可证结论 |
+   | `RENDER_GPU_IDS` | Blender 渲染使用的物理 GPU 列表 |
+   | `TRAIN_GPU_IDS` | 正式 DDP 使用的8张物理 GPU |
+   | `FORMAL_RUN_ID` | Stage 2 正式 run 的唯一名称 |
+
+3. 生成和验证组合数据：
+
+   ```bash
+   bash scripts/run_stage2.sh data
+   ```
+
+   若已有当前 object/scene digest 对应的 annotation，保持 `REUSE_ANNOTATION=true`。如果需要重新调用 Qwen 标注，设置 `REUSE_ANNOTATION=false`，并选择以下一种方式：
+
+   ```bash
+   # 方式一：先在 scripts/stage2.env 中设置 START_VLLM=true，
+   # 然后让脚本自己启动和关闭 vLLM
+   bash scripts/run_stage2.sh data
+
+   # 方式二：另一个终端提前启动，stage2.env 中保持 START_VLLM=false
+   vllm serve Qwen/Qwen3-14B --host 127.0.0.1 --port 8000
+   ```
+
+   `data` 成功的终点不是只有渲染文件存在，而是 manifest 构建、组件验证和 Dataset inspection 全部返回成功。
+
+4. 运行仓库级检查：
+
+   ```bash
+   bash scripts/run_stage2.sh tests
+   ```
+
+5. 使用组合数据执行训练 smoke：
+
+   ```bash
+   bash scripts/run_stage2.sh smoke
+   ```
+
+   脚本会确定性选择小 manifest 和覆盖全部任务的 sampler 前缀，自动连续调用两次现有 `train_tokenlight.py`：第一次执行 forward/backward/update 并保存 checkpoint，第二次精确恢复后再更新一次。这里的“smoke 两段”只是恢复验收，不是 Stage 1/Stage 2 课程训练。
+
+6. 启动 Stage 2 正式8卡训练：
+
+   ```bash
+   bash scripts/run_stage2.sh train
+   ```
+
+   首次 Stage 2 训练必须保持：
+
+   ```bash
+   FORMAL_RESUME_CHECKPOINT=
+   ```
+
+   此时模型从 `STAGE1_CHECKPOINT` 加载权重，但 optimizer、global step 和 sampler 都新建。有效 global batch 的计算是：
+
+   ```text
+   FORMAL_MICRO_BATCH_SIZE × FORMAL_GRADIENT_ACCUMULATION_STEPS × 8
+   ```
+
+7. 评估 checkpoint：
+
+   ```bash
+   bash scripts/run_stage2.sh eval
+   ```
+
+   `EVAL_CHECKPOINT` 为空时会选择 `${TOKENLIGHT_OUTPUT_ROOT}/${FORMAL_RUN_ID}/checkpoints/` 下编号最大的 checkpoint；需要评估指定权重时，在 `stage2.env` 中填写其完整目录。
+
+#### 中断恢复与失败重跑
+
+- **正式训练中断**：把 `FORMAL_RESUME_CHECKPOINT` 设置为同一个 Stage 2 run 的 checkpoint 目录，再执行 `train`。不得在恢复时改变 manifest、world size、学习率、batch、任务概率或 lighting/flow 语义。
+- **想重新开始正式训练**：清空 `FORMAL_RESUME_CHECKPOINT`，并更换 `FORMAL_RUN_ID`；脚本不会覆盖已有 run。
+- **smoke 失败或需要重跑**：修复原因后更换 `SMOKE_RUN_ID`。旧 summary 不会被当作新数据版本的通过结果。
+- **渲染失败**：查看 `${DATASET_ROOT}/render_errors.jsonl`、`${DATASET_ROOT}/runtime/composition_worker_*.log` 和 `${DATASET_ROOT}/components/<job_id>.partial/failure.json`。默认重跑会保留已有 `.partial` 并返回其诊断路径；确认失败原因后，只清理需要重做的单个 job，再执行渲染：
+
+  ```bash
+  python -m lightconstruction.cli clear-render-partial \
+    --config configs/default.yaml \
+    --job-id <job_id>
+  bash scripts/run_stage2.sh render
+  ```
+
+  清理命令只接受当前 `render_jobs_output` manifest 中唯一存在且带 `failure.json` 的 job；不会清理其他 partial，也不会删除已完成的 `metadata.json`。
+- **数据在 smoke 后变化**：重新执行 `data` 和 `smoke`。`train` 会比较完整 manifest 与 `dataset_release.json` 的 SHA256，并拒绝复用过期 smoke。
+- **只想完整串行运行**：确认全部路径、许可证和 GPU 已经用分步流程验证后，再执行 `bash scripts/run_stage2.sh all`。
 
 ### `OBJECT_ROOT`
 
@@ -352,10 +514,27 @@ m4:
   render_gpu_ids: [0]
   render_workers: 1
   overwrite: false
+  camera_strategy: generated_target_visible
+  camera_candidate_count: 24
+  camera_subject_fill_range: [0.25, 0.60]
+  camera_ndc_x_range: [0.15, 0.85]
+  camera_ndc_y_range: [0.15, 0.85]
   render:
     resolution: 256
     samples: 16
 ```
+
+服务器上保留一条真实小 Blender batch 验收路径。复制一份独立环境文件，将其中
+`MAX_RENDER_JOBS=1`、`RENDER_GPU_IDS=0`、`RENDER_WORKERS=1`，并把
+`DATASET_ROOT` 改为独立验收目录；确认输入路径和许可证后运行：
+
+```bash
+cp scripts/stage2.env scripts/stage2.blender-acceptance.env
+STAGE2_ENV_FILE=scripts/stage2.blender-acceptance.env \
+  bash scripts/run_stage2.sh data
+```
+
+该命令必须在装有项目 Python 依赖、真实 Blender、GPU、Objaverse 资产和 scene blend 的服务器上执行；检查生成 metadata 的相机 NDC、主体可见像素、`fixture_source`，并让后续 composition validator 通过。本地 focused 测试不等价于此真实 batch，也不得替代服务器验收结果。
 
 运行：
 
@@ -373,7 +552,7 @@ outputs/tokenlight_dataset/render_errors.jsonl
 outputs/tokenlight_dataset/render_workers/*/errors.jsonl
 ```
 
-组件目录先写为 `<job_id>.partial`，只有 metadata 完整后才原子改名。`overwrite: false` 会复用已有完整 `metadata.json`，但拒绝覆盖不完整目录；修复原因后应明确清理对应单个 partial job，再重试。
+组件目录先写为 `<job_id>.partial`，只有 metadata 完整后才原子改名。`overwrite: false` 会复用已有完整 `metadata.json`；无论 `overwrite` 配置如何，已有 partial 都不会被 renderer 自动删除。检查 `<job_id>.partial/failure.json` 后，使用 `python -m lightconstruction.cli clear-render-partial --config configs/default.yaml --job-id <job_id>` 明确清理该单个失败 job，再重新执行渲染。
 
 ## 11. 构建 split 和严格验证
 
@@ -434,17 +613,69 @@ python tools/tokenlight_data/inspect_dataset.py \
 
 每次构建还会写 `dataset_release.json`，保存 split、fixture 来源、许可证政策、lineage digest 和三个 manifest digest。
 
-## 12. 固定 manifest 训练 smoke
+## 12. 两阶段训练：简易数据预训练，再用组合数据微调
+
+推荐把两类数据分成两个独立训练 run，而不是混在同一个 manifest 中：
+
+1. **Stage 1（简易数据）**：切回原分支/原代码，使用 Lumina 原有的简易场景搭建与渲染数据训练 TokenLight。
+2. **Stage 2（组合数据）**：切到当前代码，使用本 README 生成的 object + scene 组合数据继续训练。
+
+Stage 1 正常从 Lumina 上游权重开始，示意配置如下：
+
+```yaml
+paths:
+  upstream_checkpoint: /path/to/Lumina-Next-T2I
+  resume_checkpoint: null
+  dataset_root: /path/to/simple-tokenlight-dataset
+  train_manifest: /path/to/simple-tokenlight-dataset/manifests/train.jsonl
+  validation_manifest: /path/to/simple-tokenlight-dataset/manifests/validation.jsonl
+
+train:
+  learning_rate: 1.0e-5
+
+logging:
+  run_id: tokenlight_stage1_simple_v1
+```
+
+Stage 1 训练完成并选定 checkpoint 后，Stage 2 把该 **checkpoint 目录**作为上游权重，新建 run：
+
+```yaml
+paths:
+  upstream_checkpoint: /path/to/stage1-output/checkpoints/step_XXXXXXXXX
+  resume_checkpoint: null
+  dataset_root: /path/to/composition-tokenlight-dataset
+  train_manifest: /path/to/composition-tokenlight-dataset/manifests/train.jsonl
+  validation_manifest: /path/to/composition-tokenlight-dataset/manifests/validation.jsonl
+
+train:
+  # 组合数据微调建议先用低于 Stage 1 的学习率；具体值由真实 smoke 决定。
+  learning_rate: 2.0e-6
+
+logging:
+  run_id: tokenlight_stage2_composition_v1
+```
+
+这里必须区分两种加载语义：
+
+- **Stage 1 → Stage 2 是权重初始化**：设置 `upstream_checkpoint`，保持 `resume_checkpoint: null`；Stage 2 使用新的 optimizer、global step、sampler、输出目录和 run ID。
+- **同一 Stage 2 run 的中断续训才是精确恢复**：设置 `resume_checkpoint`；manifest、seed、任务概率、batch、world size 和关键模型配置必须与保存 checkpoint 时一致。
+
+Stage 1 与 Stage 2 的主干模型结构必须兼容。若 Stage 1 没有启用 fixture mask 分支，Stage 2 可以容许 `fixture_mask_embedder.*` 缺失并随机初始化，但这部分能力会从 Stage 2 才开始学习；如果简易数据能够提供有效 fixture mask，优先在 Stage 1 就启用它。Stage 2 开始前仍需使用其组合数据完成下一节的固定-manifest smoke；此时 smoke 的 `upstream_checkpoint` 应指向选定的 Stage 1 checkpoint，而不是重新指向原始 Lumina 权重。
+
+两个阶段应分别保留验证结果。Stage 2 至少同时观察组合数据验证集和简易数据验证集，确认组合能力提升时没有出现不可接受的基础能力遗忘；只有确实观察到遗忘时，再考虑在 Stage 2 加入少量简易数据 replay。
+
+## 13. 固定 manifest 训练 smoke
 
 Dataset 可读不等于训练可用。任何数据版本在两阶段 smoke 完成前都不是 `train-ready`。
 
-### 12.1 Smoke 配置
+### 13.1 Smoke 配置
 
 复制正式配置为服务器本地 smoke 配置，并显式修改：
 
 ```yaml
 paths:
-  upstream_checkpoint: /path/to/Lumina-Next-T2I/consolidated_ema.00-of-01.safetensors
+  # Stage 2 smoke 使用选定的 Stage 1 checkpoint 目录；单阶段训练可填原始 Lumina checkpoint。
+  upstream_checkpoint: /path/to/stage1-output/checkpoints/step_XXXXXXXXX
   vae: /path/to/sdxl-vae
   dataset_root: /path/to/fixed-small-tokenlight-dataset
   train_manifest: /path/to/fixed-small-tokenlight-dataset/manifests/train.jsonl
@@ -475,7 +706,7 @@ runtime:
 
 Smoke 强制单进程、单 GPU、`num_workers: 0`，并要求固定 sampler 序列覆盖所有启用任务。
 
-### 12.2 第一阶段
+### 13.2 第一阶段
 
 在 `Lumina-T2X/` 下仍使用正式训练入口：
 
@@ -501,7 +732,7 @@ python lumina_next_t2i/train_tokenlight.py \
 
 这不是最终通过状态。
 
-### 12.3 第二阶段恢复
+### 13.3 第二阶段恢复
 
 保持相同 manifest、seed、任务、任务概率、batch 和 optimizer 语义，只修改：
 
@@ -536,9 +767,9 @@ python lumina_next_t2i/train_tokenlight.py \
 
 任一失败只会写 `train_ready: false` 或不产生通过结果，旧数据版本的 summary 不能复用。
 
-## 13. 正式训练与评测
+## 14. 正式训练与评测
 
-Smoke 通过后，恢复正式 `max_steps`、worker、DDP 和独立 `logging.run_id`。正式训练第一次从上游 Lumina 权重开始：
+Smoke 通过后，恢复正式 `max_steps`、worker、DDP 和独立 `logging.run_id`。采用两阶段策略时，Stage 2 正式训练从已选定的 Stage 1 TokenLight checkpoint 初始化；单阶段训练时才直接从上游 Lumina 权重初始化。两者首次启动都保持：
 
 ```yaml
 paths:
@@ -573,7 +804,7 @@ python lumina_next_t2i/evaluate_tokenlight.py \
 
 当前入口提供按任务汇总的 PSNR、SSIM 和可选 LPIPS。它们不能替代位置轨迹、强度单调性、颜色误差和 mask 局部性评测；这些控制性指标需要固定 sweep 后才能声称模型学会可控光照。
 
-## 14. 测试命令
+## 15. 测试命令
 
 以下命令用于服务器或具备对应依赖的开发环境。生成数据和训练前应依次执行，但本仓库不会在缺少用户 GPU、checkpoint 和真实 manifest 时伪造通过结果。
 
@@ -597,7 +828,7 @@ python -m compileall src scripts Lumina-T2X/lumina_next_t2i Lumina-T2X/tools
 
 真实 Blender 小批次、组件 validator、全任务 Dataset inspection 和两阶段训练 smoke 是发布前必须保留输出的集成测试，不能由单元测试代替。
 
-## 15. 常见阻断条件
+## 16. 常见阻断条件
 
 ### 全部对象进入 quarantine
 
@@ -632,7 +863,7 @@ point、diffuse 和 fixture component 必须在 World strength 为零时渲染�
 
 这是安全行为。检查 manifest digest、任务和概率、batch、world size、lighting/flow 配置以及 checkpoint 是否来自同一个 smoke run。
 
-## 16. 可声明结果的边界
+## 17. 可声明结果的边界
 
 完成本 README 的数据链路和 smoke 后，可以声明：
 

@@ -7,8 +7,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from tqdm.auto import tqdm
-import yaml
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,6 +16,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    from tqdm.auto import tqdm
+
     config = load_yaml(parse_args().config)
     root = Path(config["paths"]["dataset_root"]).expanduser()
     data_config = config["data"]
@@ -132,6 +132,8 @@ def validate_scene(
     if len(diffuse_means) >= 2 and max(diffuse_means) - min(diffuse_means) <= 1e-8:
         raise ValueError("diffuse levels 没有可测量差异")
     for fixture in scene.get("in_scene_lights", []):
+        if not require_composition:
+            validate_fixture_contract(fixture)
         component = read_linear(resolve(root, fixture["path"]))
         require_shape(component, ambient, fixture["path"])
         contribution = np.maximum(component - dark, 0)
@@ -142,16 +144,7 @@ def validate_scene(
             raise ValueError(f"fixture mask shape 不一致: {mask.shape} vs {ambient.shape[:2]}")
         if float(mask.max()) <= 0:
             raise ValueError(f"fixture mask 为空: {fixture['mask']}")
-        source = fixture.get("fixture_source")
-        if source not in {"scene_native", "procedural_fallback"}:
-            raise ValueError(f"fixture_source 非法: {source}")
-        entity_id = fixture.get("fixture_entity_id")
-        if source == "scene_native" and not entity_id:
-            raise ValueError("scene_native fixture 缺少 fixture_entity_id")
-        if source == "procedural_fallback" and entity_id is not None:
-            raise ValueError("procedural_fallback fixture 不得声明 scene entity")
-        require_vector(fixture.get("position"), 3, "fixture.position")
-        require_vector(fixture.get("renderer_position"), 3, "fixture.renderer_position")
+        source = fixture["fixture_source"]
         counts[f"{source}_fixtures"] += 1
         counts["in_scene_lights"] += 1
     supported = {
@@ -167,6 +160,8 @@ def validate_scene(
 def validate_composition_contract(scene: dict[str, Any]) -> None:
     required = (
         "schema_version",
+        "camera",
+        "canonical",
         "base_scene_id",
         "base_scene_fingerprint",
         "composition",
@@ -178,6 +173,11 @@ def validate_composition_contract(scene: dict[str, Any]) -> None:
     for key in required:
         if key not in scene:
             raise ValueError(f"composition manifest 缺少字段 {key}")
+    fixtures = scene["in_scene_lights"]
+    if not isinstance(fixtures, list) or not fixtures:
+        raise ValueError("composition manifest 必须包含至少一个 in_scene_lights fixture")
+    for fixture in fixtures:
+        validate_fixture_contract(fixture)
     require_digest(scene["base_scene_fingerprint"], "base_scene_fingerprint")
     camera = scene["camera"]
     if not isinstance(camera, dict):
@@ -187,10 +187,40 @@ def validate_composition_contract(scene: dict[str, Any]) -> None:
     require_vector(camera.get("target"), 3, "camera.target")
     if camera.get("coordinate_space") != "blender_world_meter":
         raise ValueError("camera.coordinate_space 必须是 blender_world_meter")
+    if camera.get("strategy") != "generated_target_visible":
+        raise ValueError("composition camera 必须由 generated_target_visible 策略生成")
+    if int(camera.get("candidate_index", -1)) < 0:
+        raise ValueError("camera.candidate_index 非法")
+    if int(camera.get("target_visible_pixels", 0)) <= 0:
+        raise ValueError("composition camera 中没有可见 target entity 区域")
+    for key in ("shift_x", "shift_y"):
+        if not np.isfinite(float(camera.get(key, float("nan")))):
+            raise ValueError(f"camera.{key} 包含 NaN/Inf")
+    ndc_bounds = camera.get("inserted_ndc_bounds")
+    if not isinstance(ndc_bounds, dict):
+        raise ValueError("camera.inserted_ndc_bounds 必须是 mapping")
+    for key in ("min_x", "max_x", "min_y", "max_y", "width", "height", "center_x", "center_y", "min_depth"):
+        if key not in ndc_bounds or not np.isfinite(float(ndc_bounds[key])):
+            raise ValueError(f"camera.inserted_ndc_bounds.{key} 缺失或非有限值")
+    if not (
+        0.0 <= float(ndc_bounds["min_x"]) < float(ndc_bounds["max_x"]) <= 1.0
+        and 0.0 <= float(ndc_bounds["min_y"]) < float(ndc_bounds["max_y"]) <= 1.0
+        and float(ndc_bounds["min_depth"]) > 0.0
+    ):
+        raise ValueError("插入对象没有完整位于 composition camera 视锥内")
+    target_ndc = camera.get("target_entity_ndc")
+    if not isinstance(target_ndc, list) or not target_ndc:
+        raise ValueError("camera.target_entity_ndc 不能为空")
+    for index, point in enumerate(target_ndc):
+        projected = require_vector(point, 3, f"camera.target_entity_ndc[{index}]")
+        if not (0.0 <= projected[0] <= 1.0 and 0.0 <= projected[1] <= 1.0 and projected[2] > 0.0):
+            raise ValueError("target entity reference point 不在 composition camera 视锥内")
     canonical = scene["canonical"]
     if not isinstance(canonical, dict):
         raise ValueError("canonical 必须是 mapping")
     require_vector(canonical.get("origin"), 3, "canonical.origin")
+    if not np.allclose(camera["target"], canonical["origin"], atol=1e-6):
+        raise ValueError("camera.target 与 canonical.origin 不一致")
     if float(canonical.get("asset_size", 0)) <= 0:
         raise ValueError("canonical.asset_size 必须为正数")
     if canonical.get("position_axes") != "x=right,y=camera-forward,z=up":
@@ -221,6 +251,21 @@ def validate_composition_contract(scene: dict[str, Any]) -> None:
         raise ValueError("license decision 不是 allowed")
     if not license_record.get("policy_version") or license_record["policy_version"] == "unconfigured":
         raise ValueError("license policy_version 未配置")
+
+
+def validate_fixture_contract(fixture: Any) -> None:
+    if not isinstance(fixture, dict):
+        raise ValueError("in_scene_lights fixture 必须是 mapping")
+    source = fixture.get("fixture_source")
+    if source not in {"scene_native", "procedural_fallback"}:
+        raise ValueError(f"fixture_source 非法: {source}")
+    entity_id = fixture.get("fixture_entity_id")
+    if source == "scene_native" and not entity_id:
+        raise ValueError("scene_native fixture 缺少 fixture_entity_id")
+    if source == "procedural_fallback" and entity_id is not None:
+        raise ValueError("procedural_fallback fixture 不得声明 scene entity")
+    require_vector(fixture.get("position"), 3, "fixture.position")
+    require_vector(fixture.get("renderer_position"), 3, "fixture.renderer_position")
 
 
 def require_vector(value: Any, length: int, label: str) -> list[float]:
@@ -292,6 +337,8 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 
 
 def load_yaml(path: str) -> dict:
+    import yaml
+
     with Path(path).expanduser().open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
 

@@ -63,6 +63,9 @@ def build_render_jobs(
     if not yaw_choices:
         raise ValueError("m4.yaw_degrees cannot be empty")
     fixture_categories = {str(value) for value in m4.get("fixture_categories", [])}
+    camera_strategy = str(m4.get("camera_strategy", "generated_target_visible"))
+    if camera_strategy != "generated_target_visible":
+        raise ValueError("m4.camera_strategy must be generated_target_visible")
     replacement_fill = float(m4.get("replacement_fill_ratio", 0.9))
     if not 0 < replacement_fill <= 1:
         raise ValueError("m4.replacement_fill_ratio must be in (0, 1]")
@@ -115,6 +118,7 @@ def build_render_jobs(
                 desired_dimensions = list(geometry["target_dimensions"])
                 bottom_center = [center[0], center[1], center[2] + dimensions[2] * 0.5]
             yaw = yaw_choices[rng.randrange(len(yaw_choices))]
+            scene_camera = _scene_override(config, scene["scene_id"])
             annotation_id = stable_digest(
                 {
                     "annotation": current_digests["annotation"],
@@ -146,10 +150,18 @@ def build_render_jobs(
                     "yaw_degrees": yaw,
                 },
                 "camera": {
-                    "strategy": str(m4.get("camera_strategy", "existing_or_target_framed")),
-                    "name": _scene_override(config, scene["scene_id"]).get("camera"),
+                    "strategy": camera_strategy,
                     "focal_length": float(m4.get("camera_focal_length", 50.0)),
-                    "distance_scale": float(m4.get("camera_distance_scale", 3.0)),
+                    "candidate_count": int(scene_camera.get("candidate_count", m4.get("camera_candidate_count", 24))),
+                    "azimuth_degrees": list(scene_camera.get("azimuth_degrees", m4.get("camera_azimuth_degrees", [0, 45, 90, 135, 180, 225, 270, 315]))),
+                    "elevation_degrees": list(scene_camera.get("elevation_degrees", m4.get("camera_elevation_degrees", [15, 25, 35, 45]))),
+                    "subject_fill_range": list(scene_camera.get("subject_fill_range", m4.get("camera_subject_fill_range", [0.25, 0.60]))),
+                    "shift_x_range": list(scene_camera.get("shift_x_range", m4.get("camera_shift_x_range", [-0.18, 0.18]))),
+                    "shift_y_range": list(scene_camera.get("shift_y_range", m4.get("camera_shift_y_range", [-0.15, 0.15]))),
+                    "ndc_x_range": list(scene_camera.get("ndc_x_range", m4.get("camera_ndc_x_range", [0.15, 0.85]))),
+                    "ndc_y_range": list(scene_camera.get("ndc_y_range", m4.get("camera_ndc_y_range", [0.15, 0.85]))),
+                    "edge_margin": float(scene_camera.get("edge_margin", m4.get("camera_edge_margin", 0.02))),
+                    "target_minimum_visible_pixels": int(scene_camera.get("target_minimum_visible_pixels", m4.get("camera_target_minimum_visible_pixels", 64))),
                 },
                 "lighting_profile": {
                     "name": str(m4.get("lighting_profile", "tokenlight_linear_v1")),

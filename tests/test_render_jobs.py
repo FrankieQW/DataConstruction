@@ -63,6 +63,8 @@ class RenderJobsTest(unittest.TestCase):
             self.assertEqual(first["jobs"], second["jobs"])
             self.assertEqual(first["jobs"][0]["target"]["relation"], "replace")
             self.assertEqual(first["jobs"][0]["license"]["decision"], "allowed")
+            self.assertEqual(first["jobs"][0]["camera"]["strategy"], "generated_target_visible")
+            self.assertNotIn("name", first["jobs"][0]["camera"])
 
     @staticmethod
     def _object_document() -> dict:

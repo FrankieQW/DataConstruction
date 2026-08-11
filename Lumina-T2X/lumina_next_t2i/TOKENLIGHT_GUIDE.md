@@ -34,7 +34,9 @@
 - 对象与基础场景的许可决策；
 - `fixture_source`，其值只能是 `scene_native` 或 `procedural_fallback`。
 
-`in_scene_light` 使用 real-first/fallback 规则：渲染范围内有可见真实灯具时使用真实灯具 mesh，不额外添加球形 fixture；没有合格真实灯具时才创建程序化球形 fixture。两种来源都要生成独立 `_on.exr` 和可见区域 mask，统计时必须分开报告。
+正式组合 metadata 的相机必须使用 `generated_target_visible`：原 scene 相机不参与数据生成；每个 job 围绕最终插入对象创建确定性候选相机，允许主体偏离画面中心，但要求插入对象不被裁切，并要求 replace target 中心或 place_on 接触区域仍在视锥内；place_on 的 support mesh 还必须具有实际可见像素。相机确定后才定义 lighting canonical 坐标。
+
+`in_scene_light` 使用 real-first/fallback 规则：渲染范围内有可见真实灯具时使用真实灯具 mesh，不额外添加球形 fixture；没有合格真实灯具时才围绕插入对象按其 world 尺度采样程序化球形 fixture，只有通过最终自建相机的视锥和可见像素门才接受。两种来源都要生成独立 `_on.exr` 和可见区域 mask，统计时必须分开报告。
 
 Dataset 在线组合公式为：
 
@@ -73,6 +75,26 @@ python -c "import flash_attn; print(flash_attn.__version__)"
 python -c "import diffusers, fairscale, cv2, yaml; print('dependencies ok')"
 nvidia-smi
 ```
+
+### 第二阶段 Bash 入口
+
+根目录的 [`scripts/run_stage2.sh`](../../scripts/run_stage2.sh) 串联组合数据生成、严格数据门、两段训练 smoke、单机 8 卡 Stage 2 DDP 训练和单卡评估。它不负责 Stage 1 简易数据生成或 Stage 1 训练；`STAGE1_CHECKPOINT` 必须由操作者提供。
+
+```bash
+cd /path/to/lightconstruction
+cp scripts/stage2.env.example scripts/stage2.env
+# 填写服务器路径、许可证和 GPU 后：
+bash scripts/run_stage2.sh data
+bash scripts/run_stage2.sh tests
+bash scripts/run_stage2.sh smoke
+bash scripts/run_stage2.sh train
+bash scripts/run_stage2.sh eval
+
+# 或一次串行执行完整 Stage 2：
+bash scripts/run_stage2.sh all
+```
+
+默认8卡配置使用 DDP，而不是模型切分；每张卡仍保存完整 2B 模型、optimizer 和 VAE。模板因此保持 `micro_batch_size=1`、global batch 32，并开启 activation checkpointing。若修改卡数、gradient accumulation、数据或任务配置，应重新执行 smoke；8卡 checkpoint 的精确 resume 也必须保持8卡 world size。
 
 ## 3. 配置数据与任务
 
@@ -132,26 +154,56 @@ python tools/tokenlight_data/inspect_dataset.py --config lumina_next_t2i/config.
 
 `inspect_dataset.py` 使用确定性 `(index, sample_seed)` 搜索并实际读取所有启用任务。三步任一步失败时，不得进入训练 smoke。
 
-## 5. 固定 manifest 训练 smoke
+## 5. 两阶段训练：简易数据到组合数据
+
+建议采用两个相互独立的 run：
+
+- **Stage 1** 使用原分支/原代码产生的 Lumina 简易搭建数据，从原始 Lumina checkpoint 初始化并训练 TokenLight。
+- **Stage 2** 使用当前代码产生的 object + scene 组合数据，从选定的 Stage 1 TokenLight checkpoint 初始化并微调。
+
+Stage 2 的关键配置语义是：
+
+```yaml
+paths:
+  upstream_checkpoint: /operator/provided/stage1-output/checkpoints/step_XXXXXXXXX
+  resume_checkpoint: null
+  dataset_root: /operator/provided/composition-dataset
+  train_manifest: /operator/provided/composition-dataset/manifests/train.jsonl
+  validation_manifest: /operator/provided/composition-dataset/manifests/validation.jsonl
+
+train:
+  # 建议从低于 Stage 1 的学习率起步，例如 Stage 1 为 1e-5 时先试 2e-6～5e-6。
+  learning_rate: 2.0e-6
+
+logging:
+  run_id: tokenlight_stage2_composition_v1
+```
+
+`upstream_checkpoint` 表示只加载模型权重并开始新 run；`resume_checkpoint` 表示精确恢复同一 run 的模型、optimizer、global step、RNG、sampler 和样本位置。因此 Stage 1 → Stage 2 必须使用前者并保持后者为 `null`，不能把跨数据阶段切换伪装成 resume。
+
+两个阶段必须保持主干结构兼容。Stage 1 未训练 fixture mask 分支时，Stage 2 可让 `fixture_mask_embedder.*` 以缺失权重形式随机初始化，但应明确记录该能力从 Stage 2 才开始学习；若简易数据已经有可靠 fixture mask，则优先在 Stage 1 启用。Stage 2 应独立完成固定-manifest smoke，并分别评估简易数据与组合数据；只有验证到明显遗忘时，才在 Stage 2 引入少量简易数据 replay。
+
+## 6. 固定 manifest 训练 smoke
 
 Dataset 可读不等于数据已经 `train-ready`。正式训练前必须在服务器上使用现有 `train_tokenlight.py` 完成两阶段 smoke；不另建训练入口。
 
-### 5.1 操作者必须先提供
+### 6.1 操作者必须先提供
 
 - 可用 CUDA GPU 和正式训练对应的 Python/Flash Attention 环境；
-- Lumina 上游 checkpoint 和 VAE 的绝对路径；
+- Stage 1 checkpoint（两阶段训练）或 Lumina 上游 checkpoint（单阶段训练），以及 VAE 的绝对路径；
 - 已通过数据验证的固定小 dataset 与 train/validation manifest；
 - 独立 smoke `output_root` 和 `logging.run_id`。
 
 固定小 manifest 必须让确定性 sampler 序列实际覆盖全部启用任务，并至少包含有效 fixture mask；有 `scene_native` 时必须覆盖它，有 fallback 时也应覆盖 `procedural_fallback`。
 
-### 5.2 第一阶段
+### 6.2 第一阶段
 
 建立服务器本地 smoke 配置：
 
 ```yaml
 paths:
-  upstream_checkpoint: /operator/provided/Lumina-Next-T2I
+  # Stage 2 smoke 指向 Stage 1 checkpoint；单阶段 smoke 可指向原始 Lumina checkpoint。
+  upstream_checkpoint: /operator/provided/stage1-output/checkpoints/step_XXXXXXXXX
   vae: /operator/provided/sdxl-vae
   dataset_root: /operator/provided/fixed-small-dataset
   train_manifest: /operator/provided/fixed-small-dataset/manifests/train.jsonl
@@ -194,7 +246,7 @@ python lumina_next_t2i/train_tokenlight.py --config /path/to/tokenlight_smoke.ya
 {"status": "awaiting-resume", "train_ready": false}
 ```
 
-### 5.3 第二阶段恢复
+### 6.3 第二阶段恢复
 
 保持 manifest、seed、任务概率、batch、optimizer、run ID 和输出目录不变，只把：
 
@@ -215,7 +267,7 @@ train:
 
 任何检查失败、未运行，或环境/GPU/checkpoint 尚未由操作者提供时，数据版本必须保持 `not-ready`/`unverified`。
 
-## 6. 正式训练、恢复与评估
+## 7. 正式训练、恢复与评估
 
 Smoke 通过后，使用独立正式 run ID，恢复正式步数、workers 和 DDP 配置，并关闭 smoke：
 
@@ -251,7 +303,7 @@ python lumina_next_t2i/evaluate_tokenlight.py --config lumina_next_t2i/config.ya
 
 正式 test 必须使用组合渲染前就已隔离的 `test.jsonl`。当前评估提供逐任务 PSNR、SSIM 和可选 LPIPS。
 
-## 7. 仓库级测试命令
+## 8. 仓库级测试命令
 
 这些命令是操作者在相应环境中的验收步骤；文档更新本身不代表它们已经执行：
 
@@ -268,9 +320,9 @@ python tools/tokenlight_data/validate_components.py --config lumina_next_t2i/con
 python tools/tokenlight_data/inspect_dataset.py --config lumina_next_t2i/config.yaml
 ```
 
-训练 smoke 仍必须使用第 5 节的服务器环境、GPU、真实 checkpoint 和固定小 manifest，不能由普通 CPU 单元测试替代。
+训练 smoke 仍必须使用第 6 节的服务器环境、GPU、真实 checkpoint 和固定小 manifest，不能由普通 CPU 单元测试替代。
 
-## 8. 常见失败
+## 9. 常见失败
 
 - `OpenCV 无法读取 EXR`：OpenCV 构建需要 OpenEXR codec，文件必须是有限 linear RGB。
 - `configured_task_has_no_eligible_scene`：启用了任务，但正式 manifest 没有对应分量；修数据，不要静默调低任务概率。

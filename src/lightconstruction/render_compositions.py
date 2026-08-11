@@ -8,6 +8,15 @@ from typing import Any
 
 from .config import ProjectConfig
 from .io_utils import dump_json_atomic, dump_jsonl_atomic, load_jsonl, utc_now
+from .render_recovery import assert_no_existing_render_partials, clear_failed_render_partial
+
+
+def clear_render_partial(config: ProjectConfig, *, job_id: str) -> dict[str, Any]:
+    jobs_path = config.path("render_jobs_output")
+    jobs = load_jsonl(jobs_path)
+    if not jobs:
+        raise ValueError(f"render job manifest is empty: {jobs_path}")
+    return clear_failed_render_partial(config.path("tokenlight_output"), jobs, job_id)
 
 
 def render_compositions(
@@ -23,6 +32,7 @@ def render_compositions(
     if not jobs:
         raise ValueError(f"render job manifest is empty: {jobs_path}")
     output_root = config.path("tokenlight_output")
+    assert_no_existing_render_partials(output_root, jobs)
     output_root.mkdir(parents=True, exist_ok=True)
     selected_blender = str(blender_bin or m4.get("blender_bin") or config.section("scene").get("blender_bin"))
     if not selected_blender:

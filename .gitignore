@@ -18,6 +18,7 @@ venv/
 .env
 .env.*
 !.env.example
+scripts/stage2.env
 .conda/
 
 # IDE and OS

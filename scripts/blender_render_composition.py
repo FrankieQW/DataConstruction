@@ -26,6 +26,7 @@ def main() -> None:
     runtime = json.loads(Path(args.runtime_config).read_text(encoding="utf-8"))
     project_root = Path(runtime["project_root"])
     helpers = _load_helpers(project_root)
+    recovery = _load_recovery(project_root)
     jobs = _read_jsonl(Path(runtime["jobs_path"]))
     worker_index = int(runtime["worker_index"])
     worker_count = int(runtime["worker_count"])
@@ -36,7 +37,7 @@ def main() -> None:
     completed: list[dict[str, Any]] = []
     for job in selected:
         try:
-            metadata = render_job(job, runtime, helpers)
+            metadata = render_job(job, runtime, helpers, recovery)
             completed.append({"job_id": job["job_id"], "metadata": metadata})
             print(f"COMPOSITION_DONE {job['job_id']}", flush=True)
         except Exception as error:  # noqa: BLE001 - every failed render remains recoverable by job id.
@@ -55,7 +56,7 @@ def main() -> None:
         raise RuntimeError(f"worker {worker_index} failed {len(errors)} render job(s)")
 
 
-def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers) -> str:
+def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) -> str:
     output_root = Path(runtime["output_root"])
     final_directory = output_root / "components" / job["job_id"]
     metadata_path = final_directory / "metadata.json"
@@ -65,10 +66,7 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers) -> str:
         if not bool(runtime.get("overwrite", False)):
             raise FileExistsError(f"incomplete output exists and overwrite=false: {final_directory}")
         shutil.rmtree(final_directory)
-    partial = final_directory.with_name(final_directory.name + ".partial")
-    if partial.exists():
-        shutil.rmtree(partial)
-    partial.mkdir(parents=True)
+    partial = recovery.prepare_render_partial(output_root, job["job_id"])
 
     project_root = Path(runtime["project_root"])
     blend_path = (project_root / job["base_scene_blend"]).resolve()
@@ -108,21 +106,32 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers) -> str:
             target_objects,
             runtime.get("render", {}),
         )
-        camera, camera_target = _select_camera(job, target_objects)
+        camera, camera_target, camera_result = _select_camera(
+            job,
+            target_objects,
+            meshes,
+            partial,
+            render_config,
+        )
         bpy.context.scene.camera = camera
         _disable_native_lighting()
         background = _world_background(float(render_config["ambient_world_strength"]))
 
         visibility_path = partial / "diagnostics" / "inserted_visibility.png"
-        inserted_pixels = _render_mask(visibility_path, meshes, render_config)
-        if inserted_pixels < int(render_config["minimum_visible_pixels"]):
-            raise ValueError(
-                f"inserted object has only {inserted_pixels} visible pixels; "
-                f"minimum={render_config['minimum_visible_pixels']}"
-            )
+        shutil.copyfile(camera_result["mask_path"], visibility_path)
+        inserted_pixels = int(camera_result["visible_pixels"])
 
         rng = random.Random(int(job["seed"]))
-        fixture = _select_or_create_fixture(job, runtime, camera, camera_target, partial, helpers, rng)
+        fixture = _select_or_create_fixture(
+            job,
+            runtime,
+            camera,
+            camera_target,
+            camera_result["subject_diameter"],
+            partial,
+            helpers,
+            rng,
+        )
         ambient_path = partial / "ambient.exr"
         background.inputs["Strength"].default_value = float(render_config["ambient_world_strength"])
         helpers.render_exr(ambient_path)
@@ -162,6 +171,15 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers) -> str:
                 "focal_length": float(camera.data.lens),
                 "target": [float(value) for value in camera_target],
                 "coordinate_space": "blender_world_meter",
+                "strategy": "generated_target_visible",
+                "candidate_index": camera_result["candidate_index"],
+                "azimuth_degrees": camera_result["azimuth_degrees"],
+                "elevation_degrees": camera_result["elevation_degrees"],
+                "shift_x": float(camera.data.shift_x),
+                "shift_y": float(camera.data.shift_y),
+                "inserted_ndc_bounds": camera_result["inserted_ndc_bounds"],
+                "target_entity_ndc": camera_result["target_entity_ndc"],
+                "target_visible_pixels": camera_result["target_visible_pixels"],
             },
             "canonical": canonical,
             "composition": {
@@ -286,35 +304,228 @@ def _validate_scene_collisions(meshes, target_objects, render: dict[str, Any]) -
     return collisions
 
 
-def _select_camera(job: dict[str, Any], target_objects):
-    requested = job["camera"].get("name")
-    if requested and requested in bpy.data.objects and bpy.data.objects[requested].type == "CAMERA":
-        camera = bpy.data.objects[requested]
-    elif bpy.context.scene.camera and bpy.context.scene.camera.type == "CAMERA":
-        camera = bpy.context.scene.camera
+def _select_camera(job, target_objects, inserted_meshes, partial, render_config):
+    """Create a deterministic camera around the composition and reject bad framing.
+
+    Source-scene cameras are intentionally ignored: they may be arbitrarily far
+    from the selected entity and are not part of the formal data contract.
+    """
+    config = job["camera"]
+    if config.get("strategy") != "generated_target_visible":
+        raise ValueError("formal composition jobs require generated_target_visible camera strategy")
+    focal_length = float(config["focal_length"])
+    if focal_length <= 0:
+        raise ValueError("camera focal_length must be positive")
+    azimuths = [float(value) for value in config.get("azimuth_degrees", [])]
+    elevations = [float(value) for value in config.get("elevation_degrees", [])]
+    if not azimuths or not elevations:
+        raise ValueError("camera azimuth/elevation candidate lists cannot be empty")
+    if any(value < 5.0 or value > 80.0 for value in elevations):
+        raise ValueError("camera elevations must stay in [5, 80] degrees")
+    fill_range = _ordered_pair(config.get("subject_fill_range"), "camera.subject_fill_range", 0.01, 0.95)
+    shift_x_range = _ordered_pair(config.get("shift_x_range"), "camera.shift_x_range", -0.5, 0.5)
+    shift_y_range = _ordered_pair(config.get("shift_y_range"), "camera.shift_y_range", -0.5, 0.5)
+    ndc_x_range = _ordered_pair(config.get("ndc_x_range"), "camera.ndc_x_range", 0.0, 1.0)
+    ndc_y_range = _ordered_pair(config.get("ndc_y_range"), "camera.ndc_y_range", 0.0, 1.0)
+    edge_margin = float(config.get("edge_margin", 0.02))
+    if not 0.0 <= edge_margin < 0.25:
+        raise ValueError("camera edge_margin must be in [0, 0.25)")
+    candidate_count = int(config.get("candidate_count", 24))
+    if candidate_count < 1:
+        raise ValueError("camera candidate_count must be positive")
+
+    inserted_minimum, inserted_maximum = _world_bounds(inserted_meshes)
+    anchor = (inserted_minimum + inserted_maximum) * 0.5
+    dimensions = inserted_maximum - inserted_minimum
+    subject_diameter = max(float(value) for value in dimensions)
+    if subject_diameter <= 1e-8:
+        raise ValueError("inserted object is too small to frame")
+
+    data = bpy.data.cameras.new("LC_CompositionCamera")
+    camera = bpy.data.objects.new("LC_CompositionCamera", data)
+    bpy.context.collection.objects.link(camera)
+    camera.data.lens = focal_length
+    bpy.context.scene.camera = camera
+
+    rng = random.Random(int(job["seed"]) ^ 0x4C4343414D455241)
+    candidates = [(azimuth, elevation) for elevation in elevations for azimuth in azimuths]
+    rng.shuffle(candidates)
+    candidates = candidates[: min(candidate_count, len(candidates))]
+    failures: list[dict[str, Any]] = []
+    minimum_pixels = int(render_config["minimum_visible_pixels"])
+    target_minimum_pixels = int(config.get("target_minimum_visible_pixels", 64))
+    if target_minimum_pixels < 1:
+        raise ValueError("camera target_minimum_visible_pixels must be positive")
+    # A large support entity (for example a long table) need not fit in full;
+    # for place_on, keeping the contact region visible is the useful contract.
+    if job["target"]["relation"] == "place_on":
+        target_points = [Vector(job["target"]["bottom_center_world"])]
     else:
-        cameras = sorted((obj for obj in bpy.data.objects if obj.type == "CAMERA"), key=lambda obj: obj.name)
-        camera = cameras[0] if cameras else None
-    center = Vector(job["target"]["center_world"])
-    if camera is None:
-        dimensions = job["target"]["dimensions_world"]
-        distance = max(float(value) for value in dimensions) * float(job["camera"]["distance_scale"])
-        distance = max(distance, 2.0)
-        data = bpy.data.cameras.new("LC_CompositionCamera")
-        camera = bpy.data.objects.new("LC_CompositionCamera", data)
-        bpy.context.collection.objects.link(camera)
-        camera.location = center + Vector((distance * 0.7, -distance, distance * 0.5))
-        camera.data.lens = float(job["camera"]["focal_length"])
-        _look_at(camera, center)
-    target = center
-    target_meshes = [obj for obj in target_objects if obj.type == "MESH"]
-    if target_meshes:
-        minimum, maximum = _world_bounds(target_meshes)
-        target = (minimum + maximum) * 0.5
-    return camera, target
+        target_points = [Vector(job["target"]["center_world"])]
+
+    for candidate_index, (azimuth, elevation) in enumerate(candidates):
+        desired_fill = rng.uniform(*fill_range)
+        azimuth_radians = math.radians(azimuth)
+        elevation_radians = math.radians(elevation)
+        direction = Vector(
+            (
+                math.cos(elevation_radians) * math.cos(azimuth_radians),
+                math.cos(elevation_radians) * math.sin(azimuth_radians),
+                math.sin(elevation_radians),
+            )
+        ).normalized()
+        camera.data.shift_x = rng.uniform(*shift_x_range)
+        camera.data.shift_y = rng.uniform(*shift_y_range)
+        view_angle = min(float(camera.data.angle_x), float(camera.data.angle_y))
+        distance = (subject_diameter * 0.5) / math.tan(view_angle * desired_fill * 0.5)
+        distance = max(distance, subject_diameter * 1.05, 0.25)
+        camera.location = anchor + direction * distance
+        _look_at(camera, anchor)
+        bpy.context.view_layer.update()
+
+        # Correct the first-order distance estimate using the actual projected bounds.
+        projected = _project_objects(camera, inserted_meshes)
+        actual_fill = max(projected["width"], projected["height"])
+        if actual_fill > 1e-6:
+            distance *= actual_fill / desired_fill
+            camera.location = anchor + direction * distance
+            _look_at(camera, anchor)
+            bpy.context.view_layer.update()
+            projected = _project_objects(camera, inserted_meshes)
+
+        target_ndc = [_project_point(camera, point) for point in target_points]
+        reason = _camera_rejection_reason(
+            projected,
+            target_ndc,
+            fill_range,
+            ndc_x_range,
+            ndc_y_range,
+            edge_margin,
+        )
+        if reason is not None:
+            failures.append({"candidate": candidate_index, "reason": reason})
+            continue
+        mask_path = partial / "diagnostics" / f"camera_candidate_{candidate_index:03d}.png"
+        visible_pixels = _render_mask(mask_path, inserted_meshes, render_config)
+        if visible_pixels < minimum_pixels:
+            failures.append(
+                {
+                    "candidate": candidate_index,
+                    "reason": f"visible_pixels={visible_pixels} < {minimum_pixels}",
+                }
+            )
+            continue
+        if job["target"]["relation"] == "place_on":
+            visible_target_meshes = [
+                obj for obj in target_objects if obj.type == "MESH" and not obj.hide_render
+            ]
+            if not visible_target_meshes:
+                failures.append(
+                    {"candidate": candidate_index, "reason": "place_on target has no visible mesh"}
+                )
+                continue
+            target_mask_path = (
+                partial / "diagnostics" / f"camera_target_{candidate_index:03d}.png"
+            )
+            target_visible_pixels = _render_mask(
+                target_mask_path, visible_target_meshes, render_config
+            )
+            if target_visible_pixels < target_minimum_pixels:
+                failures.append(
+                    {
+                        "candidate": candidate_index,
+                        "reason": (
+                            f"target_visible_pixels={target_visible_pixels} "
+                            f"< {target_minimum_pixels}"
+                        ),
+                    }
+                )
+                continue
+        else:
+            # replace hides the original target; the inserted object is its visible proxy.
+            target_visible_pixels = visible_pixels
+        return camera, anchor, {
+            "candidate_index": candidate_index,
+            "azimuth_degrees": azimuth,
+            "elevation_degrees": elevation,
+            "visible_pixels": visible_pixels,
+            "target_visible_pixels": target_visible_pixels,
+            "mask_path": mask_path,
+            "subject_diameter": subject_diameter,
+            "inserted_ndc_bounds": projected,
+            "target_entity_ndc": target_ndc,
+        }
+
+    failure_path = partial / "diagnostics" / "camera_failures.json"
+    failure_path.parent.mkdir(parents=True, exist_ok=True)
+    failure_path.write_text(json.dumps(failures, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    raise ValueError(
+        f"no generated camera kept the composition target visible; "
+        f"candidates={len(candidates)}, diagnostics={failure_path}"
+    )
 
 
-def _select_or_create_fixture(job, runtime, camera, camera_target, partial, helpers, rng):
+def _project_objects(camera, objects) -> dict[str, float]:
+    points = [
+        world_to_camera_view(bpy.context.scene, camera, obj.matrix_world @ Vector(corner))
+        for obj in objects
+        for corner in obj.bound_box
+    ]
+    if not points:
+        raise ValueError("cannot project an empty object set")
+    xs = [float(point.x) for point in points]
+    ys = [float(point.y) for point in points]
+    depths = [float(point.z) for point in points]
+    return {
+        "min_x": min(xs),
+        "max_x": max(xs),
+        "min_y": min(ys),
+        "max_y": max(ys),
+        "width": max(xs) - min(xs),
+        "height": max(ys) - min(ys),
+        "center_x": (min(xs) + max(xs)) * 0.5,
+        "center_y": (min(ys) + max(ys)) * 0.5,
+        "min_depth": min(depths),
+    }
+
+
+def _project_point(camera, point) -> list[float]:
+    ndc = world_to_camera_view(bpy.context.scene, camera, point)
+    return [float(ndc.x), float(ndc.y), float(ndc.z)]
+
+
+def _camera_rejection_reason(projected, target_ndc, fill_range, ndc_x, ndc_y, margin):
+    if projected["min_depth"] <= 0:
+        return "inserted object crosses or is behind the camera plane"
+    if projected["min_x"] < margin or projected["max_x"] > 1.0 - margin:
+        return "inserted object is horizontally cropped"
+    if projected["min_y"] < margin or projected["max_y"] > 1.0 - margin:
+        return "inserted object is vertically cropped"
+    fill = max(projected["width"], projected["height"])
+    if not fill_range[0] <= fill <= fill_range[1]:
+        return f"subject fill {fill:.4f} is outside {fill_range}"
+    if not ndc_x[0] <= projected["center_x"] <= ndc_x[1]:
+        return "inserted object center is outside the configured horizontal framing range"
+    if not ndc_y[0] <= projected["center_y"] <= ndc_y[1]:
+        return "inserted object center is outside the configured vertical framing range"
+    for point in target_ndc:
+        if point[2] <= 0 or not ndc_x[0] <= point[0] <= ndc_x[1] or not ndc_y[0] <= point[1] <= ndc_y[1]:
+            return "target entity reference point is outside the camera framing range"
+    return None
+
+
+def _ordered_pair(value, label: str, lower_limit: float, upper_limit: float):
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError(f"{label} must contain two values")
+    result = [float(item) for item in value]
+    if result[0] > result[1] or result[0] < lower_limit or result[1] > upper_limit:
+        raise ValueError(f"{label} must be ordered inside [{lower_limit}, {upper_limit}]")
+    return result
+
+
+def _select_or_create_fixture(
+    job, runtime, camera, camera_target, subject_diameter, partial, helpers, rng
+):
     config = runtime.get("fixture", {})
     candidates: list[dict[str, Any]] = []
     for entity_id in job.get("fixture_candidate_entity_ids", []):
@@ -346,31 +557,62 @@ def _select_or_create_fixture(job, runtime, camera, camera_target, partial, help
         selected["position"] = _world_to_canonical(camera, camera_target, selected["world_position"])
         return selected
 
+    if config.get("fallback_position_mode", "subject_relative") != "subject_relative":
+        raise ValueError("fixture fallback_position_mode must be subject_relative")
     ranges = config.get(
         "fallback_position_ranges",
-        {"x": [-0.8, 0.8], "y": [-0.6, -0.1], "z": [0.4, 1.2]},
+        {"x": [-1.5, 1.5], "y": [-1.0, -0.2], "z": [0.8, 2.0]},
     )
-    canonical = [rng.uniform(*ranges[axis]) for axis in ("x", "y", "z")]
-    world_position = helpers.camera_to_world(camera, camera_target, canonical)
-    mesh, material = helpers.add_fixture(
-        "LC_ProceduralFixture",
-        world_position,
-        float(config.get("fallback_fixture_size", 0.08)),
+    candidate_count = int(config.get("fallback_candidates", 12))
+    if candidate_count < 1:
+        raise ValueError("fixture fallback_candidates must be positive")
+    size = max(
+        float(config.get("fallback_fixture_size_min", 0.01)),
+        min(
+            float(config.get("fallback_fixture_size_max", 0.08)),
+            subject_diameter * float(config.get("fallback_fixture_size_ratio", 0.12)),
+        ),
     )
-    mask_path = partial / "diagnostics" / "fixture_fallback.png"
-    pixels = _render_mask(mask_path, [mesh], _render_config(runtime.get("render", {})))
-    if pixels < int(config.get("minimum_visible_pixels", 64)):
-        raise ValueError(f"procedural fallback fixture is not sufficiently visible: {pixels} pixels")
-    return {
-        "source": "procedural_fallback",
-        "entity_id": None,
-        "objects": [mesh],
-        "world_position": world_position,
-        "position": canonical,
-        "visible_pixels": pixels,
-        "candidate_mask": mask_path,
-        "material": material,
-    }
+    minimum_pixels = int(config.get("minimum_visible_pixels", 64))
+    for candidate_index in range(candidate_count):
+        canonical = [
+            rng.uniform(*ranges[axis]) * subject_diameter for axis in ("x", "y", "z")
+        ]
+        world_position = helpers.camera_to_world(camera, camera_target, canonical)
+        ndc = world_to_camera_view(bpy.context.scene, camera, world_position)
+        if float(ndc.z) <= 0 or not 0.05 <= float(ndc.x) <= 0.95 or not 0.05 <= float(ndc.y) <= 0.95:
+            continue
+        mesh, material = helpers.add_fixture(
+            f"LC_ProceduralFixture_{candidate_index:03d}",
+            world_position,
+            size,
+        )
+        mask_path = partial / "diagnostics" / f"fixture_fallback_{candidate_index:03d}.png"
+        pixels = _render_mask(mask_path, [mesh], _render_config(runtime.get("render", {})))
+        if pixels >= minimum_pixels:
+            return {
+                "source": "procedural_fallback",
+                "entity_id": None,
+                "objects": [mesh],
+                "world_position": world_position,
+                "position": canonical,
+                "visible_pixels": pixels,
+                "candidate_mask": mask_path,
+                "material": material,
+            }
+        _remove_fixture_mesh(mesh, material)
+    raise ValueError(
+        f"no procedural fallback fixture passed the visibility gate after {candidate_count} candidates"
+    )
+
+
+def _remove_fixture_mesh(mesh, material) -> None:
+    mesh_data = mesh.data
+    bpy.data.objects.remove(mesh, do_unlink=True)
+    if mesh_data.users == 0:
+        bpy.data.meshes.remove(mesh_data)
+    if material is not None and material.users == 0:
+        bpy.data.materials.remove(material)
 
 
 def _render_fixture_component(fixture, partial, output_root, final_directory, config, helpers):
@@ -687,6 +929,16 @@ def _load_helpers(project_root: Path):
     spec = importlib.util.spec_from_file_location("tokenlight_render_assets", path)
     if spec is None or spec.loader is None:
         raise ImportError(path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_recovery(project_root: Path):
+    path = project_root / "src" / "lightconstruction" / "render_recovery.py"
+    spec = importlib.util.spec_from_file_location("lightconstruction_render_recovery", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load render recovery helpers: {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
