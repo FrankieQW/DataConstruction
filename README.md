@@ -134,42 +134,288 @@ outputs/
 
 ## 4. 环境
 
-建议分开准备数据环境、Blender 和 TokenLight 训练环境。
+本流程面向 Linux GPU 服务器。不要用一次无版本约束的 `pip install -e .` 修改已经能运行 Stage 1 的 `lum` 环境。推荐把职责拆为四部分：
 
-### LightConstruction
+| 环境或程序 | 用途 | 是否修改现有 `lum` |
+|---|---|---|
+| `lightconstruction` Conda 环境 | M1–M4 外层 Python、annotation client、manifest 与数据验证 | 否 |
+| Blender 4.5 可执行文件 | FBX 归一化、组合渲染和 Blender focused checks | 不属于 Conda |
+| 独立 `vllm` Conda 环境 | 仅在需要重新生成 annotation 时提供 OpenAI-compatible 服务 | 否 |
+| 已验证的 `lum` 环境 | TokenLight smoke、8 卡训练和评估 | 保持不变 |
+
+`run_stage2.sh` 每次 action 只读取一个 `PYTHON_BIN`，所以不要用 `all` 跨越两个 Python 环境。分别准备 data 与 train 参数文件，并按阶段执行。
+
+### 4.1 服务器、驱动和编译工具预检
+
+先确认 GPU 驱动、8 张目标 GPU 和基础工具：
 
 ```bash
-conda create -n lightconstruction python=3.11 -y
-conda activate lightconstruction
-pip install -e .
+nvidia-smi
+gcc --version
+which conda
+which bash
 ```
 
-M1–M4 外层命令均从仓库根运行：
+PyTorch wheel/Conda 包携带的是 CUDA runtime；编译 `flash-attn` 时通常还需要含 `nvcc` 的 CUDA Toolkit。只有需要编译扩展的环境才检查：
 
 ```bash
+nvcc --version
+echo "${CUDA_HOME:-CUDA_HOME is not set}"
+```
+
+不要仅根据 `nvidia-smi` 顶部显示的“CUDA Version”选择 PyTorch；它表示驱动支持上限，不表示当前 Python 中 PyTorch 的 CUDA runtime。最终以以下输出为准：
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+### 4.2 LightConstruction 数据环境
+
+从仓库根目录建立全新环境；在这个新环境中执行可编辑安装不会影响 `lum`：
+
+```bash
+cd /path/to/lightconstruction
+conda create -n lightconstruction python=3.11 -y
+conda activate lightconstruction
+conda install pytorch==2.1.0 cpuonly -c pytorch -y
+python -m pip install -U pip setuptools wheel
+python -m pip install -e .
+python -m pip install numpy opencv-python-headless Pillow
+```
+
+根项目的 `pyproject.toml` 会安装 `openai`、`orjson`、`pydantic`、`PyYAML` 和 `tqdm`。额外的 NumPy/OpenCV 用于 component validator，Pillow 和 PyTorch 用于 `inspect_dataset.py`；这些检查在 CPU 上运行，因此数据环境不需要 CUDA PyTorch。若不使用上面的参考版本，也应让数据环境的 PyTorch major/minor 与已验证训练环境一致。验证：
+
+```bash
+python - <<'PY'
+import cv2
+import numpy
+import openai
+import orjson
+import pydantic
+import torch
+import yaml
+from PIL import Image
+print("LightConstruction dependencies OK; torch:", torch.__version__)
+PY
 python -m lightconstruction.cli --help
 ```
 
-### Blender
+M1–M4 的 Python 命令均从仓库根运行。`lightconstruction.cli` 只是仓库自己的薄命令入口，不是外部服务。
 
-`configs/default.yaml` 默认指向 `/opt/blender-4.5/blender`。服务器先确认：
+### 4.3 Blender 4.5
+
+Blender 使用自己的 Python，不要安装进 Conda。`configs/default.yaml` 的示例路径是 `/opt/blender-4.5/blender`，但 `scripts/stage2.env` 中的 `BLENDER_BIN` 必须改成服务器真实可执行文件：
 
 ```bash
-/opt/blender-4.5/blender --version
+export BLENDER_BIN=/actual/path/to/blender-4.5/blender
+test -x "${BLENDER_BIN}"
+"${BLENDER_BIN}" --version
 ```
 
-M2 默认要求 Blender 4.5。M4 composition worker 通过 `--factory-startup` 启动，并为每个 job 重新打开 base blend。
+输出应为 Blender 4.5.x。M2 使用该程序归一化 FBX；M4 composition worker 通过 `--factory-startup` 启动，每个 worker 保持一个 Blender 进程并连续处理其 job，但每个 job 都会重新打开对应 base blend。`RENDER_PERSISTENT_DATA=true` 启用 Cycles persistent data，不代表跨 worker 或跨脚本常驻 Blender。
 
-### TokenLight
+### 4.4 独立部署 vLLM
+
+只有 `REUSE_ANNOTATION=false` 或没有可复用的 `data/annotation_construction.json` 时才需要 vLLM。不要为了 M3 修改现有 `lum`，建立独立服务环境：
 
 ```bash
-cd Lumina-T2X
+conda create -n vllm python=3.11 -y
+conda activate vllm
+python -m pip install -U pip
+python -m pip install vllm
+python -c "import vllm; print(vllm.__version__)"
+which vllm
+```
+
+如果服务器不能在线下载 Hugging Face 模型，先把 Qwen3-14B 放到本地共享存储，并将后续 `VLLM_MODEL` 和启动命令都改成同一个本地目录。单卡手动部署：
+
+```bash
+conda activate vllm
+CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-14B \
+  --host 127.0.0.1 \
+  --port 8000
+```
+
+另一个终端验证服务，而不是只检查进程存在：
+
+```bash
+curl --fail http://127.0.0.1:8000/v1/models
+```
+
+此时 data 参数文件使用：
+
+```bash
+REUSE_ANNOTATION=false
+START_VLLM=false
+VLLM_MODEL=Qwen/Qwen3-14B
+VLLM_BASE_URL=http://127.0.0.1:8000/v1
+```
+
+也可以让脚本启动并在 annotation 结束后关闭服务。把独立环境入口的绝对路径写入参数文件：
+
+```bash
+REUSE_ANNOTATION=false
+START_VLLM=true
+VLLM_BIN=/actual/conda/envs/vllm/bin/vllm
+VLLM_MODEL=Qwen/Qwen3-14B
+VLLM_GPU_IDS=0
+```
+
+当前自动启动入口只设置 `CUDA_VISIBLE_DEVICES`，没有传 `--tensor-parallel-size`；因此 `VLLM_GPU_IDS=0,1` 不等于启用两卡张量并行。需要多卡时保持 `START_VLLM=false`，手动运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 vllm serve Qwen/Qwen3-14B \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --tensor-parallel-size 2
+```
+
+脚本自动启动失败时查看 `${RUNTIME_DIR}/vllm.log`。手动服务不会由脚本关闭；完成 M3 后应由操作者停止，释放 Blender/训练需要的 GPU。
+
+### 4.5 TokenLight、PyTorch、CUDA 和 FlashAttention
+
+如果现有 `lum` 已经跑通 Stage 1，优先原样复用，先保存环境清单，不执行任何安装或升级。它可以直接用于 smoke/train/eval；若 Stage 2 缺包，则使用克隆环境，不要修补原环境：
+
+```bash
+conda activate lum
+python -m pip freeze > /path/outside/repo/lum-environment-freeze.txt
+python -m pip check
+```
+
+验证 Stage 2 的实际必需项：
+
+```bash
+cd /path/to/lightconstruction/Lumina-T2X
+python - <<'PY'
+import accelerate
+import cv2
+import diffusers
+import fairscale
+import flash_attn
+import safetensors
+import tensorboard
+import torch
+import transformers
+import yaml
+
+print("torch:", torch.__version__)
+print("torch CUDA runtime:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+print("visible GPUs:", torch.cuda.device_count())
+print("flash-attn:", flash_attn.__version__)
+print("TokenLight dependencies OK")
+PY
+```
+
+当前 Next-DiT 配置强制 `runtime.flash_attention=true`，所以 `flash_attn` 不是可选依赖；Apex 则是可选项，不要安装 Python-only Apex。若现有 `lum` 缺少任何依赖，或者希望使用统一的 `run_stage2.sh tests`，先克隆环境并只修改克隆：
+
+```bash
+conda create -n lum-stage2 --clone lum -y
+conda activate lum-stage2
+cd /path/to/lightconstruction
+python -m pip install -e .
+python -m pip check
+```
+
+仅当没有可复用训练环境时，才按 Lumina-Next-T2I 上游文档建立新环境。仓库当前给出的参考组合是 Python 3.11、PyTorch 2.1.0、torchvision 0.16.0、torchaudio 2.1.0 和 CUDA runtime 12.1；不要用它覆盖一个已经验证的环境：
+
+```bash
 conda create -n tokenlight python=3.11 -y
 conda activate tokenlight
-pip install -e .
+conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 \
+  pytorch-cuda=12.1 -c pytorch -c nvidia -y
+
+cd /path/to/lightconstruction/Lumina-T2X
+python -m pip install -r requirements.txt
+python -m pip install ninja packaging
+python -m pip install flash-attn --no-build-isolation
+python -m pip install -e . --no-deps
+python -m pip check
 ```
 
-训练还需要与服务器匹配的 PyTorch、CUDA、Flash Attention、VAE 和 Lumina-Next-T2I 2B 单 shard checkpoint。上游 checkpoint 加载时只允许 TokenLight 新增的 `lighting_encoder` 和 `fixture_mask_embedder` keys 缺失。
+`flash-attn` 必须在 PyTorch 安装后构建；若无兼容预编译包，构建使用的 `nvcc`/`CUDA_HOME` 必须与该 PyTorch CUDA runtime 兼容。仓库没有锁定 FlashAttention 版本，因此新环境必须先通过 import、单卡 smoke 和 8 卡 DDP smoke，再冻结版本，不能仅凭安装命令成功认定可用。
+
+检查8张训练卡：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python - <<'PY'
+import torch
+assert torch.cuda.is_available()
+assert torch.cuda.device_count() == 8, torch.cuda.device_count()
+for index in range(8):
+    print(index, torch.cuda.get_device_name(index))
+PY
+```
+
+### 4.6 模型、VAE 和 checkpoint 文件
+
+权重必须位于仓库外，由操作者在 env 文件中提供绝对路径：
+
+```text
+/path/to/stage1/checkpoints/step_XXXXXXXXX/   # STAGE1_CHECKPOINT
+/path/to/sdxl-vae/                           # VAE_PATH
+  config.json
+  diffusion_pytorch_model.safetensors
+```
+
+`STAGE1_CHECKPOINT` 是已完成 Stage 1 的 TokenLight checkpoint 目录，不是任意单个权重文件。首次 Stage 2 加载时 optimizer/global step/sampler 会重新创建；只有 `FORMAL_RESUME_CHECKPOINT` 才恢复完整 Stage 2 训练状态。VAE 必须是可由 Diffusers `AutoencoderKL.from_pretrained()` 读取的目录。上游权重加载只允许 TokenLight 新增的 `lighting_encoder` 和 `fixture_mask_embedder` keys 缺失。
+
+运行前检查：
+
+```bash
+test -d "${STAGE1_CHECKPOINT}"
+test -f "${VAE_PATH}/config.json"
+test -f "${VAE_PATH}/diffusion_pytorch_model.safetensors"
+```
+
+### 4.7 用两份 env 文件隔离 data 与 train
+
+不要提交包含服务器路径的实际 env 文件。建立两份本地参数文件：
+
+```bash
+cp scripts/stage2.env.example scripts/stage2.data.env
+cp scripts/stage2.env.example scripts/stage2.train.env
+```
+
+`scripts/stage2.data.env`：
+
+```bash
+PYTHON_BIN=/actual/conda/envs/lightconstruction/bin/python
+VLLM_BIN=/actual/conda/envs/vllm/bin/vllm
+```
+
+`scripts/stage2.train.env`：原 `lum` 已通过全部 import 时可以直接指向它；需要补依赖或运行统一 tests 时，指向 `lum-stage2` 克隆。
+
+```bash
+PYTHON_BIN=/actual/conda/envs/lum/bin/python
+```
+
+两份文件中的 `RUNTIME_DIR`、`DATASET_ROOT`、`TOKENLIGHT_OUTPUT_ROOT`、模型路径、许可证和训练参数必须保持一致。执行：
+
+```bash
+STAGE2_ENV_FILE=scripts/stage2.data.env bash scripts/run_stage2.sh data
+
+STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh smoke
+STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh train
+STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh eval
+```
+
+统一的 tests action 同时运行根项目和 Lumina-T2X 测试，需要 `lum-stage2` 这类兼具两边依赖的克隆环境：
+
+```bash
+STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh tests
+```
+
+如果坚持让 `stage2.train.env` 指向完全不改动的原 `lum`，则分别使用环境绝对路径执行三段检查，不使用统一 tests action：
+
+```bash
+/actual/conda/envs/lightconstruction/bin/python -m unittest discover -s tests -p 'test_*.py'
+/actual/path/to/blender-4.5/blender --background --factory-startup \
+  --python tests/blender_composition_focus.py
+(cd Lumina-T2X && /actual/conda/envs/lum/bin/python -m unittest discover -s tests -p 'test_*.py')
+```
+
+不要在分离环境模式下执行 `bash scripts/run_stage2.sh all`，因为一次 shell 运行只能使用一个 `PYTHON_BIN`。
 
 ## 5. 正式运行前必须填写的配置
 
@@ -179,25 +425,25 @@ pip install -e .
 
 仓库提供 [`scripts/run_stage2.sh`](scripts/run_stage2.sh)，用于从 object/scene 预处理一直执行到组合渲染、数据门、固定-manifest smoke、8 卡正式训练和评估。它**不会生成 Stage 1 简易数据，也不会训练 Stage 1**；选定的 Stage 1 TokenLight checkpoint 是操作者提供给 Stage 2 的只读输入。
 
-先建立服务器参数文件：
+按第 4.7 节建立 data/train 两份服务器参数文件；如果明确选择单环境运行，也可以使用默认文件名：
 
 ```bash
 cp scripts/stage2.env.example scripts/stage2.env
 vim scripts/stage2.env
 ```
 
-必须填写实际 `OBJECT_ROOT`、Blender、Stage 1 checkpoint、VAE、许可证政策和 GPU 编号。包含空格的值必须像模板中的 attribution 一样加引号。模板默认正式训练使用 8×A100、BF16、micro batch 1、gradient accumulation 4，因此 global batch 为 32，并开启 activation checkpointing。
+必须填写实际 `OBJECT_ROOT`、Blender、Stage 1 checkpoint、VAE、许可证政策和 GPU 编号。包含空格的值必须像模板中的 attribution 一样加引号。正式训练固定使用配置中的 BF16；模板的 micro batch 1、gradient accumulation 4 和 8 卡对应 global batch 32。`FORMAL_ACTIVATION_CHECKPOINTING` 必须显式填写：显存足够的 A100 建议设为 `false` 以避免重算开销，出现 OOM 时再设为 `true` 并使用新 `FORMAL_RUN_ID`。固定-manifest smoke 为降低单卡显存压力会独立强制开启 activation checkpointing，不受该变量控制。
 
 在仓库根目录按需执行：
 
 | 命令 | 执行范围 |
 |---|---|
-| `bash scripts/run_stage2.sh data` | M1 object、M2 scene、M3 annotation、M4 组合渲染、manifest、组件验证和 Dataset inspection |
-| `bash scripts/run_stage2.sh tests` | 运行 LightConstruction 与 Lumina-T2X 的仓库级单元检查 |
-| `bash scripts/run_stage2.sh smoke` | 自动选择固定小 manifest，单卡执行 forward/backward/update/checkpoint 和第二段精确恢复 |
-| `bash scripts/run_stage2.sh train` | smoke 与数据摘要仍匹配后，启动单机 8 卡 Stage 2 DDP 正式训练 |
-| `bash scripts/run_stage2.sh eval` | 使用 `EVAL_CHECKPOINT`，或自动选择正式 run 中最新 checkpoint，在单卡评估 |
-| `bash scripts/run_stage2.sh all` | 依次执行 data、tests、smoke、train 和 eval |
+| `STAGE2_ENV_FILE=scripts/stage2.data.env bash scripts/run_stage2.sh data` | M1 object、M2 scene、M3 annotation、M4 组合渲染、manifest、组件验证和 Dataset inspection |
+| `STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh tests` | 仅在 `PYTHON_BIN` 指向兼具两边依赖的 `lum-stage2` 克隆时运行全部检查 |
+| `STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh smoke` | 固定小 manifest，单卡执行 forward/backward/update/checkpoint 和精确恢复 |
+| `STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh train` | smoke 与数据摘要仍匹配后，启动单机 8 卡 Stage 2 DDP |
+| `STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh eval` | 使用指定或自动选择的正式 checkpoint 单卡评估 |
+| `bash scripts/run_stage2.sh all` | 仅适用于一个 Python 同时具备 data 与 train 全部依赖的环境；分离环境时禁用 |
 
 已有且 digest 仍有效的 `data/annotation_construction.json` 可通过 `REUSE_ANNOTATION=true` 复用。需要重新标注时，可以先自行启动 vLLM；也可以设置 `START_VLLM=true`，让脚本启动并在标注结束后关闭它。正式渲染不使用 `--allow-partial`，每个 render worker 只启动一次 Blender 并连续消费分配给它的 job；`RENDER_PERSISTENT_DATA=true` 同时启用 Cycles persistent data。
 
@@ -213,33 +459,130 @@ outputs/stage2_runtime/tokenlight_evaluate.yaml
 
 `train` 会拒绝以下情况：smoke 未通过、checkpoint resume 未验证、完整 train/validation manifest 或 `dataset_release.json` 在 smoke 后变化、8 卡列表数量不等于 8，或者未设置 resume 却复用了已有正式 run 目录。正式断点续训时填写 `FORMAL_RESUME_CHECKPOINT`，并保持原来的8卡 world size和训练签名。
 
+#### `stage2.env` 变量完整清单
+
+可执行文件和配置：
+
+| 变量 | 是否可空 | 作用与约束 |
+|---|---|---|
+| `PYTHON_BIN` | 否 | 当前 action 使用的 Python；data 指向 `lightconstruction`，tests/smoke/train/eval 指向 `lum` |
+| `BLENDER_BIN` | 否 | Blender 4.5.x 可执行文件的绝对路径 |
+| `PROJECT_BASE_CONFIG` | 否 | LightConstruction 基础配置，通常为 `configs/default.yaml` |
+| `TOKENLIGHT_BASE_CONFIG` | 否 | TokenLight 基础配置，通常为 `Lumina-T2X/lumina_next_t2i/config.yaml` |
+| `RUNTIME_DIR` | 否 | 生成的 project/formal/smoke/eval YAML 和 vLLM 日志目录；两份 env 必须一致 |
+| `OBJECT_ROOT` | 否 | Objaverse canonical asset 根目录；`object.json` 中保存的是相对路径 |
+| `STAGE1_CHECKPOINT` | 否 | 已完成 Stage 1 的 TokenLight checkpoint 目录；不是 Stage 2 resume |
+| `VAE_PATH` | 否 | SDXL VAE 的 Diffusers 目录 |
+| `DATASET_ROOT` | 否 | composition 分量、manifest、validator 和 release 输出根目录 |
+| `TOKENLIGHT_OUTPUT_ROOT` | 否 | smoke 之外的正式 Stage 2 训练输出根目录 |
+
+许可证：
+
+| 变量 | 是否可空 | 作用与约束 |
+|---|---|---|
+| `OBJECT_LICENSE_ALLOWLIST` | 否 | 与 `object.json` 规范名称匹配的逗号分隔白名单，比较时忽略大小写 |
+| `LICENSE_POLICY_VERSION` | 否 | 操作者批准的策略版本；不能使用 `unconfigured` |
+| `BASE_SCENE_LICENSE_NAME` | 否 | Bistro 的已核验许可证名称 |
+| `BASE_SCENE_SOURCE_URI` | 否 | 场景规范来源 URL |
+| `BASE_SCENE_ATTRIBUTION` | 否 | 必需署名；含空格时加引号 |
+| `BASE_SCENE_LICENSE_DECISION` | 否 | 正式数据必须严格为 `allowed` |
+
+annotation/vLLM：
+
+| 变量 | 是否可空 | 作用与约束 |
+|---|---|---|
+| `REUSE_ANNOTATION` | 否 | `true` 时仅在目标文件存在时复用；M4 仍校验 object/scene digest |
+| `START_VLLM` | 否 | `true` 由脚本启动/关闭服务；`false` 要求 `/v1/models` 已可访问 |
+| `VLLM_BIN` | 否 | 自动启动时使用的 `vllm` 命令，推荐独立环境绝对路径 |
+| `VLLM_MODEL` | 否 | server 与 annotation request 共用的模型名或本地模型目录 |
+| `VLLM_BASE_URL` | 否 | OpenAI-compatible 基址，默认 `http://127.0.0.1:8000/v1` |
+| `VLLM_GPU_IDS` | 否 | 自动启动时写入 `CUDA_VISIBLE_DEVICES`；不自动启用 tensor parallel |
+| `VLLM_CONCURRENCY` | 否 | annotation 并发请求数；显存/服务不稳时降低 |
+| `VLLM_WAIT_SECONDS` | 否 | 自动启动健康检查超时秒数 |
+
+Blender composition：
+
+| 变量 | 是否可空 | 作用与约束 |
+|---|---|---|
+| `RENDER_GPU_IDS` | 否 | Blender worker 可见的物理 GPU，逗号分隔且不能重复 |
+| `RENDER_WORKERS` | 否 | Blender 常驻 worker 数；保守设置为每 GPU 一个 |
+| `RENDER_RESOLUTION` | 否 | 渲染与 TokenLight data resolution，共用同一整数 |
+| `RENDER_SAMPLES` | 否 | Cycles samples |
+| `RENDER_PERSISTENT_DATA` | 否 | 严格为 `true` 或 `false` |
+| `MAX_RENDER_JOBS` | 是 | 空表示全部；真实小 batch 验收填写 `1`，不可把该产物当正式全量数据 |
+
+smoke 与正式训练：
+
+| 变量 | 是否可空 | 作用与约束 |
+|---|---|---|
+| `SMOKE_GPU_ID` | 否 | 单卡 smoke 使用的物理 GPU |
+| `SMOKE_MAX_MANIFEST_ROWS` | 否 | 固定 smoke manifest 最大行数 |
+| `SMOKE_MAX_SCHEDULE_SAMPLES` | 否 | 为覆盖全部任务搜索 sampler 前缀的上限 |
+| `SMOKE_RUN_ID` | 否 | smoke 唯一名称；同名输出存在时拒绝覆盖 |
+| `TRAIN_GPU_IDS` | 否 | 正式单机 DDP 必须恰好列出8张物理 GPU |
+| `FORMAL_RUN_ID` | 否 | 正式 run 唯一名称；新训练不得复用已有目录 |
+| `FORMAL_MICRO_BATCH_SIZE` | 否 | 每个 rank 的 micro batch |
+| `FORMAL_GRADIENT_ACCUMULATION_STEPS` | 否 | 梯度累积次数；global batch 为该值 × micro batch × 8 |
+| `FORMAL_MAX_STEPS` | 否 | 正式 optimizer update 总步数 |
+| `FORMAL_LEARNING_RATE` | 否 | 正式 AdamW 学习率 |
+| `FORMAL_NUM_WORKERS` | 否 | 每个 DDP rank 的 DataLoader worker 数；总进程压力约为该值 × 8 |
+| `FORMAL_ACTIVATION_CHECKPOINTING` | 否 | `false` 更快但占显存；`true` 省显存但重算；resume 时不得改变 |
+| `FORMAL_RESUME_CHECKPOINT` | 是 | 首次训练留空；恢复时填同一个 Stage 2 run 的 checkpoint 目录 |
+| `EVAL_GPU_ID` | 否 | 单卡评估使用的物理 GPU |
+| `EVAL_CHECKPOINT` | 是 | 空时自动选择正式 run 中编号最大的 checkpoint |
+
 #### 首次运行指南
 
-脚本面向 Linux 服务器，并假定 LightConstruction 与 Lumina-T2X 的依赖已经安装在同一个可用 Python 环境中。建议不要第一次就执行 `all`；先分段确认产物，可以更快定位路径、许可证、Blender、数据和显存问题。
+建议不要第一次执行 `all`；使用分离环境逐段确认产物，才能准确定位路径、许可证、vLLM、Blender、数据和显存问题。
 
-1. 进入训练环境并检查基础程序：
+1. 分别检查数据与训练环境：
 
    ```bash
    cd /path/to/lightconstruction
-   conda activate tokenlight
-   python -c "import torch; print(torch.__version__, torch.cuda.device_count())"
-   python -c "import flash_attn, diffusers, fairscale, cv2, yaml; print('dependencies ok')"
-   /opt/blender-4.5/blender --version
+   conda activate lightconstruction
+   python -c "import openai, orjson, pydantic, numpy, cv2, torch, yaml; print('data env OK')"
+
+   conda activate lum
+   python -c "import torch, flash_attn, diffusers, fairscale, cv2, yaml; print(torch.__version__, torch.version.cuda, torch.cuda.device_count())"
+
+   /actual/path/to/blender-4.5/blender --version
    nvidia-smi
    ```
 
 2. 复制参数模板并填写服务器实际值：
 
    ```bash
-   cp scripts/stage2.env.example scripts/stage2.env
-   vim scripts/stage2.env
+   cp scripts/stage2.env.example scripts/stage2.data.env
+   cp scripts/stage2.env.example scripts/stage2.train.env
+   vim scripts/stage2.data.env
+   vim scripts/stage2.train.env
+   ```
+
+   先做无数据副作用的语法和路径预检：
+
+   ```bash
+   bash -n scripts/run_stage2.sh
+
+   set -a
+   source scripts/stage2.data.env
+   set +a
+   "${PYTHON_BIN}" -m lightconstruction.cli --help
+   test -x "${BLENDER_BIN}"
+   test -d "${OBJECT_ROOT}"
+   test -d "${STAGE1_CHECKPOINT}"
+   test -f "${VAE_PATH}/config.json"
+
+   set -a
+   source scripts/stage2.train.env
+   set +a
+   "${PYTHON_BIN}" -c "import torch, flash_attn; assert torch.cuda.is_available(); print(torch.__version__, torch.version.cuda, torch.cuda.device_count())"
    ```
 
    最少需要确认：
 
    | 参数 | 含义 |
    |---|---|
-   | `PYTHON_BIN` | 当前 TokenLight 环境的 Python，可填写绝对路径 |
+   | `PYTHON_BIN` | data 文件填 `lightconstruction` Python，train 文件填已验证的 `lum`/`lum-stage2` Python；推荐绝对路径 |
    | `BLENDER_BIN` | Blender 4.5 可执行文件 |
    | `OBJECT_ROOT` | Objaverse canonical asset 根目录 |
    | `STAGE1_CHECKPOINT` | 已完成的 Stage 1 TokenLight checkpoint 目录；脚本不会生成它 |
@@ -253,32 +596,33 @@ outputs/stage2_runtime/tokenlight_evaluate.yaml
 3. 生成和验证组合数据：
 
    ```bash
-   bash scripts/run_stage2.sh data
+   STAGE2_ENV_FILE=scripts/stage2.data.env bash scripts/run_stage2.sh data
    ```
 
    若已有当前 object/scene digest 对应的 annotation，保持 `REUSE_ANNOTATION=true`。如果需要重新调用 Qwen 标注，设置 `REUSE_ANNOTATION=false`，并选择以下一种方式：
 
    ```bash
-   # 方式一：先在 scripts/stage2.env 中设置 START_VLLM=true，
+   # 方式一：先在 scripts/stage2.data.env 中设置 START_VLLM=true，
    # 然后让脚本自己启动和关闭 vLLM
-   bash scripts/run_stage2.sh data
+   STAGE2_ENV_FILE=scripts/stage2.data.env bash scripts/run_stage2.sh data
 
-   # 方式二：另一个终端提前启动，stage2.env 中保持 START_VLLM=false
+   # 方式二：另一个终端提前启动，stage2.data.env 中保持 START_VLLM=false
    vllm serve Qwen/Qwen3-14B --host 127.0.0.1 --port 8000
+   curl --fail http://127.0.0.1:8000/v1/models
    ```
 
    `data` 成功的终点不是只有渲染文件存在，而是 manifest 构建、组件验证和 Dataset inspection 全部返回成功。
 
-4. 运行仓库级检查：
+4. 运行仓库级检查。只有 `stage2.train.env` 指向已安装根项目依赖的 `lum-stage2` 克隆时才使用统一入口；否则使用第 4.7 节的三段分离命令：
 
    ```bash
-   bash scripts/run_stage2.sh tests
+   STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh tests
    ```
 
 5. 使用组合数据执行训练 smoke：
 
    ```bash
-   bash scripts/run_stage2.sh smoke
+   STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh smoke
    ```
 
    脚本会确定性选择小 manifest 和覆盖全部任务的 sampler 前缀，自动连续调用两次现有 `train_tokenlight.py`：第一次执行 forward/backward/update 并保存 checkpoint，第二次精确恢复后再更新一次。这里的“smoke 两段”只是恢复验收，不是 Stage 1/Stage 2 课程训练。
@@ -286,7 +630,7 @@ outputs/stage2_runtime/tokenlight_evaluate.yaml
 6. 启动 Stage 2 正式8卡训练：
 
    ```bash
-   bash scripts/run_stage2.sh train
+   STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh train
    ```
 
    首次 Stage 2 训练必须保持：
@@ -304,10 +648,10 @@ outputs/stage2_runtime/tokenlight_evaluate.yaml
 7. 评估 checkpoint：
 
    ```bash
-   bash scripts/run_stage2.sh eval
+   STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh eval
    ```
 
-   `EVAL_CHECKPOINT` 为空时会选择 `${TOKENLIGHT_OUTPUT_ROOT}/${FORMAL_RUN_ID}/checkpoints/` 下编号最大的 checkpoint；需要评估指定权重时，在 `stage2.env` 中填写其完整目录。
+   `EVAL_CHECKPOINT` 为空时会选择 `${TOKENLIGHT_OUTPUT_ROOT}/${FORMAL_RUN_ID}/checkpoints/` 下编号最大的 checkpoint；需要评估指定权重时，在 `stage2.train.env` 中填写其完整目录。
 
 #### 中断恢复与失败重跑
 
@@ -317,15 +661,22 @@ outputs/stage2_runtime/tokenlight_evaluate.yaml
 - **渲染失败**：查看 `${DATASET_ROOT}/render_errors.jsonl`、`${DATASET_ROOT}/runtime/composition_worker_*.log` 和 `${DATASET_ROOT}/components/<job_id>.partial/failure.json`。默认重跑会保留已有 `.partial` 并返回其诊断路径；确认失败原因后，只清理需要重做的单个 job，再执行渲染：
 
   ```bash
-  python -m lightconstruction.cli clear-render-partial \
-    --config configs/default.yaml \
+  set -a
+  source scripts/stage2.data.env
+  set +a
+
+  "${PYTHON_BIN}" -m lightconstruction.cli clear-render-partial \
+    --config outputs/stage2_runtime/project.yaml \
     --job-id <job_id>
-  bash scripts/run_stage2.sh render
+  OBJECT_ROOT="${OBJECT_ROOT}" "${PYTHON_BIN}" -m lightconstruction.cli render \
+    --config outputs/stage2_runtime/project.yaml \
+    --blender-bin "${BLENDER_BIN}" \
+    --workers "${RENDER_WORKERS}"
   ```
 
   清理命令只接受当前 `render_jobs_output` manifest 中唯一存在且带 `failure.json` 的 job；不会清理其他 partial，也不会删除已完成的 `metadata.json`。
 - **数据在 smoke 后变化**：重新执行 `data` 和 `smoke`。`train` 会比较完整 manifest 与 `dataset_release.json` 的 SHA256，并拒绝复用过期 smoke。
-- **只想完整串行运行**：确认全部路径、许可证和 GPU 已经用分步流程验证后，再执行 `bash scripts/run_stage2.sh all`。
+- **只想完整串行运行**：只有同一个 Python 已经同时通过 data 与 train 的全部依赖检查时，才能在逐段验证后执行 `bash scripts/run_stage2.sh all`；采用推荐的分离环境时必须按 action 分开运行。
 
 ### `OBJECT_ROOT`
 
@@ -444,10 +795,11 @@ python -m lightconstruction.cli prepare-scenes \
 
 ## 8. M3：生成 `annotation_construction.json`
 
-先启动 OpenAI-compatible vLLM：
+完整的独立环境安装、单卡/多卡部署、自动启动限制和日志位置见第 4.4 节。手动服务示例：
 
 ```bash
 vllm serve Qwen/Qwen3-14B --host 127.0.0.1 --port 8000
+curl --fail http://127.0.0.1:8000/v1/models
 ```
 
 再运行：
