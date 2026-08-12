@@ -171,19 +171,37 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 
 ### 4.2 LightConstruction 数据环境
 
-从仓库根目录建立全新环境；在这个新环境中执行可编辑安装不会影响 `lum`：
+先读取已经跑通 Stage 1 的 `lum` 环境版本；不要根据 README 猜版本，也不要修改 `lum`：
+
+```bash
+conda activate lum
+python - <<'PY'
+import torch
+import torchvision
+import torchaudio
+print("torch:", torch.__version__)
+print("torchvision:", torchvision.__version__)
+print("torchaudio:", torchaudio.__version__)
+print("torch CUDA runtime:", torch.version.cuda)
+print("CUDA available:", torch.cuda.is_available())
+PY
+conda list | grep -E '^(pytorch|torch|torchvision|torchaudio|pytorch-cuda|cuda)\s'
+```
+
+从仓库根目录建立全新环境，并使用与上述 `lum` **完全相同**的 PyTorch、torchvision、torchaudio 和 CUDA runtime 组合。下面只是在 `lum` 恰好为 PyTorch 2.1.0/CUDA 12.1 时的示例；实际命令必须替换成 `lum` 的版本：
 
 ```bash
 cd /path/to/lightconstruction
 conda create -n lightconstruction python=3.11 -y
 conda activate lightconstruction
-conda install pytorch==2.1.0 cpuonly -c pytorch -y
+conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 \
+  pytorch-cuda=12.1 -c pytorch -c nvidia -y
 python -m pip install -U pip setuptools wheel
 python -m pip install -e .
 python -m pip install numpy opencv-python-headless Pillow
 ```
 
-根项目的 `pyproject.toml` 会安装 `openai`、`orjson`、`pydantic`、`PyYAML` 和 `tqdm`。额外的 NumPy/OpenCV 用于 component validator，Pillow 和 PyTorch 用于 `inspect_dataset.py`；这些检查在 CPU 上运行，因此数据环境不需要 CUDA PyTorch。若不使用上面的参考版本，也应让数据环境的 PyTorch major/minor 与已验证训练环境一致。验证：
+根项目的 `pyproject.toml` 会安装 `openai`、`orjson`、`pydantic`、`PyYAML` 和 `tqdm`。额外的 NumPy/OpenCV 用于 component validator，Pillow 和 PyTorch 用于 `inspect_dataset.py`。虽然当前 inspection 的张量计算主要发生在 CPU，数据环境仍与 `lum` 使用同一 CUDA PyTorch 组合，避免依赖和 ABI 分叉。验证版本和 CUDA 可用性：
 
 ```bash
 python - <<'PY'
@@ -195,7 +213,11 @@ import pydantic
 import torch
 import yaml
 from PIL import Image
-print("LightConstruction dependencies OK; torch:", torch.__version__)
+assert torch.cuda.is_available()
+print("LightConstruction dependencies OK")
+print("torch:", torch.__version__)
+print("torch CUDA runtime:", torch.version.cuda)
+print("visible GPUs:", torch.cuda.device_count())
 PY
 python -m lightconstruction.cli --help
 ```
