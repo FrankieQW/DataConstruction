@@ -16,9 +16,7 @@ def clear_render_partial(config: ProjectConfig, *, job_id: str) -> dict[str, Any
     jobs = load_jsonl(jobs_path)
     if not jobs:
         raise ValueError(f"render job manifest is empty: {jobs_path}")
-    job_ids = [str(job.get("job_id") or "") for job in jobs]
-    if any(not job_id for job_id in job_ids) or len(set(job_ids)) != len(job_ids):
-        raise ValueError(f"render job manifest contains missing or duplicate job_id values: {jobs_path}")
+    _validated_job_ids(jobs, jobs_path)
     return clear_failed_render_partial(config.path("tokenlight_output"), jobs, job_id)
 
 
@@ -34,6 +32,7 @@ def render_compositions(
     jobs = load_jsonl(jobs_path)
     if not jobs:
         raise ValueError(f"render job manifest is empty: {jobs_path}")
+    job_ids = _validated_job_ids(jobs, jobs_path)
     output_root = config.path("tokenlight_output")
     assert_no_existing_render_partials(output_root, jobs)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -156,3 +155,12 @@ def render_compositions(
             f"see {output_root / 'render_summary.json'}"
         )
     return summary
+
+
+def _validated_job_ids(jobs: list[dict[str, Any]], jobs_path: Path) -> list[str]:
+    job_ids = [str(job.get("job_id") or "") for job in jobs]
+    if any(not job_id for job_id in job_ids) or len(set(job_ids)) != len(job_ids):
+        raise ValueError(
+            f"render job manifest contains missing or duplicate job_id values: {jobs_path}"
+        )
+    return job_ids
