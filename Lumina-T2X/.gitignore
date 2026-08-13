@@ -161,5 +161,7 @@ cython_debug/
 
 # Project-specific gitignores
 test_*
+!tests/
+!tests/test_*.py
 
 results/
