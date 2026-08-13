@@ -840,7 +840,9 @@ python -m lightconstruction.cli annotate-construction \
 - `data/annotation_cache.jsonl`
 - `data/annotation_review.jsonl`
 
-必须确认 `unresolved_pairs` 符合预期，且文件中的 object/scene digest 与当前输入一致。M4 会拒绝 stale annotation。
+必须确认 `unresolved_pairs` 符合预期，且文件中的 object/scene digest 与当前输入一致。低于
+`annotation.confidence_review_threshold` 的 LLM 关系只进入 review，不会生成正式 target；M4
+复用旧 annotation 时也会依据 `class_rules` 再执行同一置信度门。M4 会拒绝 stale annotation。
 
 ## 9. M4：几何准备和组合 job
 
@@ -859,6 +861,9 @@ outputs/reports/geometry_quarantine.jsonl
 ```
 
 正式批次前应逐项解释 quarantine。不能为了提高成功率而给未知对象添加宽松默认尺度。
+资产解析优先使用 `object.json` 的 `canonical_path`；若旧 inventory 的该字段带有并不存在的
+`glbs/` 前缀，则只在同一个 `OBJECT_ROOT` 内回退到 `inventory_path`。不需要创建
+`glbs -> OBJECT_ROOT` 的自引用软链接，任何解析到 `OBJECT_ROOT` 外的路径都会被拒绝。
 
 ### 9.2 生成固定组合
 
@@ -876,7 +881,9 @@ python -m lightconstruction.cli build-render-jobs \
 - `render_jobs.summary.json`：输入 digests、统计和完整 job 文档。
 - `render_job_rejects.jsonl`：缺 blend、缺 entity 等拒绝原因。
 
-相同输入、配置和 seed 必须产生相同 job ID、target、yaw 和 transform 目标。
+相同输入、配置和 seed 必须产生相同 job ID、target、yaw 和 transform 目标。job ID 还绑定
+实际 GLB/normalized blend 摘要、几何契约、fixture 候选、许可证和渲染配置；其中任一项变化
+都会生成新的 job ID，避免复用旧渲染。
 
 ## 10. M4：组合渲染
 
@@ -896,6 +903,7 @@ m4:
   render:
     resolution: 256
     samples: 16
+    require_gpu: true
 ```
 
 服务器上保留一条真实小 Blender batch 验收路径。复制一份独立环境文件，将其中
@@ -926,7 +934,13 @@ outputs/tokenlight_dataset/render_errors.jsonl
 outputs/tokenlight_dataset/render_workers/*/errors.jsonl
 ```
 
-组件目录先写为 `<job_id>.partial`，只有 metadata 完整后才原子改名。`overwrite: false` 会复用已有完整 `metadata.json`；无论 `overwrite` 配置如何，已有 partial 都不会被 renderer 自动删除。检查 `<job_id>.partial/failure.json` 后，使用 `python -m lightconstruction.cli clear-render-partial --config configs/default.yaml --job-id <job_id>` 明确清理该单个失败 job，再重新执行渲染。
+组件目录先写为 `<job_id>.partial`，只有 metadata 完整后才原子改名。缺文件、摘要变化和许可证
+失败会在创建 partial 前终止。`overwrite: false` 仅在已有 `metadata.json` 的
+`render_job_digest` 与当前 job 完全一致时复用；不一致时拒绝覆盖。无论 `overwrite` 配置如何，
+已有 partial 都不会被 renderer 自动删除。检查 `<job_id>.partial/failure.json` 后，使用
+`python -m lightconstruction.cli clear-render-partial --config configs/default.yaml --job-id <job_id>`
+明确清理该单个失败 job，再重新执行渲染。正式 composition 默认要求 Cycles GPU 初始化成功，
+不会静默回退 CPU。
 
 ## 11. 构建 split 和严格验证
 
@@ -936,6 +950,7 @@ outputs/tokenlight_dataset/render_workers/*/errors.jsonl
 paths:
   dataset_root: /absolute/path/to/outputs/tokenlight_dataset
   render_output_root: /absolute/path/to/outputs/tokenlight_dataset
+  render_jobs_manifest: /absolute/path/to/outputs/manifests/render_jobs.jsonl
   train_manifest: /absolute/path/to/outputs/tokenlight_dataset/manifests/train.jsonl
   validation_manifest: /absolute/path/to/outputs/tokenlight_dataset/manifests/validation.jsonl
   test_manifest: /absolute/path/to/outputs/tokenlight_dataset/manifests/test.jsonl
@@ -985,7 +1000,10 @@ python tools/tokenlight_data/inspect_dataset.py \
 - `object-held-out`：同一 `asset_uid` 不跨 split；允许复用 base scene，只能声明对象泛化。
 - `scene-held-out`：同一 `base_scene_id` 不跨 split；至少需要三个不同 base scene。场景不足时直接失败。
 
-每次构建还会写 `dataset_release.json`，保存 split、fixture 来源、许可证政策、lineage digest 和三个 manifest digest。
+`require_composition_contract: true` 时，manifest builder 只读取 `render_jobs_manifest` 中列出的
+精确 job，并核对 metadata 的 job ID、对象、场景和 `render_job_digest`；同一输出根下的历史完成
+目录不会混入当前数据集，其 ID 会记录在 `ignored_foreign_completed_outputs`。每次构建还会写
+`dataset_release.json`，保存 split、fixture 来源、许可证政策、lineage digest 和三个 manifest digest。
 
 ## 12. 两阶段训练：简易数据预训练，再用组合数据微调
 

@@ -445,6 +445,8 @@ def configure_render(config: dict) -> None:
                 scene.cycles.device = "GPU"
                 print(f"Cycles GPU: {', '.join(enabled_devices)}", flush=True)
             except Exception as error:
+                if bool(config.get("require_gpu", False)):
+                    raise RuntimeError(f"Cycles GPU 初始化失败且 require_gpu=true: {error}") from error
                 print(f"Cycles GPU 初始化失败，回退 CPU: {error}", flush=True)
                 scene.cycles.device = "CPU"
 

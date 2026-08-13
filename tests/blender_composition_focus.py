@@ -27,6 +27,7 @@ class BlenderCompositionFocusTest(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.renderer = load_renderer()
         cls.helpers = cls.renderer._load_helpers(ROOT)
+        cls.recovery = cls.renderer._load_recovery(ROOT)
 
     def setUp(self) -> None:
         bpy.ops.object.select_all(action="SELECT")
@@ -118,6 +119,43 @@ class BlenderCompositionFocusTest(unittest.TestCase):
         finally:
             self.renderer._render_mask = original_render_mask
 
+    def test_preflight_failure_does_not_create_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "output"
+            job = self._preflight_job()
+            runtime = {
+                "project_root": str(root),
+                "object_root": str(root / "objects"),
+                "output_root": str(output_root),
+                "render": {"require_verified_license": True},
+            }
+            with self.assertRaises(FileNotFoundError):
+                self.renderer.render_job(job, runtime, self.helpers, self.recovery)
+            self.assertFalse(
+                (output_root / "components" / f"{job['job_id']}.partial").exists()
+            )
+
+    def test_reuse_rejects_stale_render_job_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "output"
+            job = self._preflight_job()
+            metadata_path = output_root / "components" / job["job_id"] / "metadata.json"
+            metadata_path.parent.mkdir(parents=True)
+            metadata_path.write_text(
+                '{"id":"composition_focus","lineage":{"render_job_digest":"sha256:old"}}',
+                encoding="utf-8",
+            )
+            runtime = {
+                "project_root": str(root),
+                "object_root": str(root / "objects"),
+                "output_root": str(output_root),
+                "overwrite": False,
+            }
+            with self.assertRaisesRegex(FileExistsError, "does not match"):
+                self.renderer.render_job(job, runtime, self.helpers, self.recovery)
+
     @staticmethod
     def _cube(name: str, location, *, size: float = 1.0):
         bpy.ops.mesh.primitive_cube_add(size=size, location=location)
@@ -148,6 +186,18 @@ class BlenderCompositionFocusTest(unittest.TestCase):
                 "candidate_count": 1,
                 "target_minimum_visible_pixels": 64,
             },
+        }
+
+    @staticmethod
+    def _preflight_job() -> dict:
+        return {
+            "job_id": "composition_focus",
+            "base_scene_blend": "missing.blend",
+            "base_scene_digest": "sha256:" + "1" * 64,
+            "object_asset_path": "missing.glb",
+            "prepared_geometry": {"asset_digest": "sha256:" + "2" * 64},
+            "license": {"decision": "allowed"},
+            "lineage": {"render_job_digest": "sha256:" + "3" * 64},
         }
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -80,16 +81,7 @@ def prepare_geometry(config: ProjectConfig) -> dict[str, Any]:
             if fit_mode not in {"uniform_fit", "exact_dimensions"}:
                 raise ValueError(f"unsupported fit_mode: {fit_mode}")
 
-            asset_path = Path(str(row["canonical_path"]))
-            if not asset_path.is_absolute():
-                asset_path = object_root / asset_path
-            asset_path = asset_path.resolve()
-            if not asset_path.is_file():
-                raise FileNotFoundError(f"object asset does not exist: {asset_path}")
-            try:
-                asset_relative = asset_path.relative_to(object_root).as_posix()
-            except ValueError as exc:
-                raise ValueError("object asset resolves outside OBJECT_ROOT") from exc
+            asset_path, asset_relative = _resolve_asset_path(row, object_root)
 
             license_name = str(row.get("license") or "").strip()
             allowed = not enforce_allowlist or license_name.lower() in allowlist
@@ -156,9 +148,35 @@ def _dimensions(value: Any) -> list[float]:
     if not isinstance(value, list) or len(value) != 3:
         raise ValueError("target_dimensions must contain exactly three meter values")
     dimensions = [float(item) for item in value]
-    if any(item <= 0 for item in dimensions):
-        raise ValueError("target_dimensions must be positive")
+    if any(not math.isfinite(item) or item <= 0 for item in dimensions):
+        raise ValueError("target_dimensions must contain finite positive values")
     return dimensions
+
+
+def _resolve_asset_path(row: dict[str, Any], object_root: Path) -> tuple[Path, str]:
+    """Resolve an asset using inventory_path as a bounded legacy fallback."""
+    candidates: list[str] = []
+    for key in ("canonical_path", "inventory_path"):
+        value = str(row.get(key) or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+    if not candidates:
+        raise ValueError("object row has neither canonical_path nor inventory_path")
+
+    root = object_root.resolve()
+    attempted: list[str] = []
+    for candidate in candidates:
+        path = Path(candidate).expanduser()
+        resolved = (path if path.is_absolute() else root / path).resolve()
+        try:
+            relative = resolved.relative_to(root).as_posix()
+        except ValueError:
+            attempted.append(f"{candidate} (outside OBJECT_ROOT)")
+            continue
+        attempted.append(str(resolved))
+        if resolved.is_file():
+            return resolved, relative
+    raise FileNotFoundError("object asset does not exist; attempted: " + ", ".join(attempted))
 
 
 def _axis(value: Any, field: str) -> str:

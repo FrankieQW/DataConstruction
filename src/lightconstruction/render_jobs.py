@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import random
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,9 @@ from .schemas import (
     RenderJobDocument,
     SceneDocument,
 )
+
+
+_RENDER_JOB_CONTRACT_VERSION = "2"
 
 
 def build_render_jobs(
@@ -60,24 +64,50 @@ def build_render_jobs(
     if sorted(relation_priority) != ["place_on", "replace"]:
         raise ValueError("m4.relation_priority must contain place_on and replace exactly once")
     yaw_choices = [float(value) for value in m4.get("yaw_degrees", [0, 90, 180, 270])]
-    if not yaw_choices:
-        raise ValueError("m4.yaw_degrees cannot be empty")
+    if not yaw_choices or any(not math.isfinite(value) for value in yaw_choices):
+        raise ValueError("m4.yaw_degrees must contain finite values")
     fixture_categories = {str(value) for value in m4.get("fixture_categories", [])}
     camera_strategy = str(m4.get("camera_strategy", "generated_target_visible"))
     if camera_strategy != "generated_target_visible":
         raise ValueError("m4.camera_strategy must be generated_target_visible")
     replacement_fill = float(m4.get("replacement_fill_ratio", 0.9))
-    if not 0 < replacement_fill <= 1:
+    if not math.isfinite(replacement_fill) or not 0 < replacement_fill <= 1:
         raise ValueError("m4.replacement_fill_ratio must be in (0, 1]")
 
     object_by_uid = {row["uid"]: row for row in objects["objects"]}
     geometry_by_uid = {row["object_uid"]: row for row in prepared["geometries"]}
     targets = annotations["targets_by_object_category"]
+    confidence_threshold = float(
+        config.section("annotation").get("confidence_review_threshold", 0.8)
+    )
+    if not math.isfinite(confidence_threshold) or not 0.0 <= confidence_threshold <= 1.0:
+        raise ValueError("annotation.confidence_review_threshold must be finite and in [0, 1]")
+    rule_index = {
+        (rule["object_category"], rule["scene_category"]): rule
+        for rule in annotations["class_rules"]
+    }
     jobs: list[dict[str, Any]] = []
     rejects: list[dict[str, Any]] = []
-    max_jobs = m4.get("max_render_jobs")
+    max_jobs_value = m4.get("max_render_jobs")
+    max_jobs: int | None = None
+    if max_jobs_value is not None:
+        if isinstance(max_jobs_value, bool):
+            raise ValueError("m4.max_render_jobs must be a positive integer or null")
+        max_jobs = int(max_jobs_value)
+        if max_jobs <= 0:
+            raise ValueError("m4.max_render_jobs must be a positive integer or null")
+    render_contract_digest = stable_digest(
+        {
+            "contract_version": _RENDER_JOB_CONTRACT_VERSION,
+            "generator_version": __version__,
+            "render": m4.get("render", {}),
+            "fixture": m4.get("fixture", {}),
+        }
+    )
+    blend_digests: dict[Path, str] = {}
 
     for geometry in sorted(prepared["geometries"], key=lambda row: row["object_uid"]):
+        jobs_before_object = len(jobs)
         uid = geometry["object_uid"]
         object_row = object_by_uid.get(uid)
         if object_row is None:
@@ -99,9 +129,23 @@ def build_render_jobs(
                     }
                 )
                 continue
+            if blend_path not in blend_digests:
+                blend_digests[blend_path] = sha256_file(blend_path)
+            base_scene_blend_digest = blend_digests[blend_path]
             entities = {row["entity_id"]: row for row in scene["entities"]}
             candidates = {
-                relation: sorted(entities[entity_id] for entity_id in ids if entity_id in entities)
+                relation: [
+                    entities[entity_id]
+                    for entity_id in sorted(ids)
+                    if entity_id in entities
+                    and _rule_allows_target(
+                        rule_index,
+                        geometry["object_category"],
+                        entities[entity_id]["category"],
+                        relation,
+                        confidence_threshold,
+                    )
+                ]
                 for relation, ids in allowed.items()
             }
             relation = next((item for item in relation_priority if candidates[item]), None)
@@ -115,7 +159,9 @@ def build_render_jobs(
                 desired_dimensions = [value * replacement_fill for value in dimensions]
                 bottom_center = [center[0], center[1], center[2] - dimensions[2] * 0.5]
             else:
-                desired_dimensions = list(geometry["target_dimensions"])
+                desired_dimensions = _three_positive(
+                    geometry["target_dimensions"], "prepared geometry target dimensions"
+                )
                 bottom_center = [center[0], center[1], center[2] + dimensions[2] * 0.5]
             yaw = yaw_choices[rng.randrange(len(yaw_choices))]
             scene_camera = _scene_override(config, scene["scene_id"])
@@ -137,7 +183,7 @@ def build_render_jobs(
                 "prepared_geometry": geometry,
                 "base_scene_id": scene["scene_id"],
                 "base_scene_blend": scene["normalized_blend"],
-                "base_scene_digest": scene["source_digest"],
+                "base_scene_digest": base_scene_blend_digest,
                 "target": {
                     "relation": relation,
                     "entity_id": target["entity_id"],
@@ -179,6 +225,8 @@ def build_render_jobs(
                     "object_digest": current_digests["object"],
                     "scene_digest": current_digests["scene"],
                     "prepared_geometry_digest": current_digests["prepared_geometry"],
+                    "base_scene_source_digest": scene["source_digest"],
+                    "render_contract_digest": render_contract_digest,
                     "config_digest": config.digest,
                     "generator_version": __version__,
                 },
@@ -192,10 +240,21 @@ def build_render_jobs(
                     else "unverified",
                 },
             }
-            job_payload["job_id"] = _job_id(job_payload)
+            _validate_camera_contract(job_payload["camera"])
+            render_job_digest = stable_digest(_job_identity(job_payload))
+            job_payload["lineage"]["render_job_digest"] = render_job_digest
+            job_payload["job_id"] = _job_id(render_job_digest)
             jobs.append(RenderJob.model_validate(job_payload).model_dump(mode="json"))
             if max_jobs is not None and len(jobs) >= int(max_jobs):
                 break
+        if len(jobs) == jobs_before_object:
+            rejects.append(
+                {
+                    "object_uid": uid,
+                    "object_category": geometry["object_category"],
+                    "reason": "no_eligible_high_confidence_target",
+                }
+            )
         if max_jobs is not None and len(jobs) >= int(max_jobs):
             break
 
@@ -224,6 +283,10 @@ def build_render_jobs(
     dump_jsonl_atomic(selected_output, document["jobs"])
     dump_json_atomic(config.path("render_jobs_summary"), document)
     dump_jsonl_atomic(config.path("render_job_rejects"), document["rejects"])
+    if not document["jobs"]:
+        raise RuntimeError(
+            "render-job generation produced zero jobs; inspect render_job_rejects and annotation targets"
+        )
     return document
 
 
@@ -232,18 +295,40 @@ def _seed_for(seed: int, *parts: str) -> int:
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
 
 
-def _job_id(payload: dict[str, Any]) -> str:
-    identity = {
+def _job_identity(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
         key: payload[key]
-        for key in ("object_uid", "base_scene_id", "target", "camera", "lighting_profile", "seed")
-    }
-    return "composition_" + stable_digest(identity).removeprefix("sha256:")[:20]
+        for key in (
+            "schema_version",
+            "seed",
+            "annotation_id",
+            "object_uid",
+            "object_category",
+            "object_asset_path",
+            "prepared_geometry",
+            "base_scene_id",
+            "base_scene_blend",
+            "base_scene_digest",
+            "target",
+            "camera",
+            "lighting_profile",
+            "fixture_candidate_entity_ids",
+            "license",
+        )
+    } | {"render_contract_digest": payload["lineage"]["render_contract_digest"]}
+
+
+def _job_id(render_job_digest: str) -> str:
+    return "composition_" + render_job_digest.removeprefix("sha256:")[:20]
 
 
 def _three(value: Any, label: str) -> list[float]:
     if not isinstance(value, list) or len(value) != 3:
         raise ValueError(f"{label} must contain three values")
-    return [float(item) for item in value]
+    result = [float(item) for item in value]
+    if any(not math.isfinite(item) for item in result):
+        raise ValueError(f"{label} must contain finite values")
+    return result
 
 
 def _three_positive(value: Any, label: str) -> list[float]:
@@ -261,3 +346,47 @@ def _scene_override(config: ProjectConfig, scene_id: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise TypeError(f"scene render override must be a mapping: {scene_id}")
     return value
+
+
+def _validate_camera_contract(camera: dict[str, Any]) -> None:
+    scalar_fields = ("focal_length", "edge_margin")
+    sequence_fields = (
+        "azimuth_degrees",
+        "elevation_degrees",
+        "subject_fill_range",
+        "shift_x_range",
+        "shift_y_range",
+        "ndc_x_range",
+        "ndc_y_range",
+    )
+    for field in scalar_fields:
+        value = float(camera[field])
+        if not math.isfinite(value):
+            raise ValueError(f"camera.{field} must be finite")
+    for field in sequence_fields:
+        values = camera[field]
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"camera.{field} must be a non-empty list")
+        if any(not math.isfinite(float(value)) for value in values):
+            raise ValueError(f"camera.{field} must contain finite values")
+    if int(camera["candidate_count"]) <= 0:
+        raise ValueError("camera.candidate_count must be positive")
+    if int(camera["target_minimum_visible_pixels"]) <= 0:
+        raise ValueError("camera.target_minimum_visible_pixels must be positive")
+
+
+def _rule_allows_target(
+    rules: dict[tuple[str, str], dict[str, Any]],
+    object_category: str,
+    scene_category: str,
+    relation: str,
+    confidence_threshold: float,
+) -> bool:
+    rule = rules.get((object_category, scene_category))
+    if rule is None:
+        return False
+    confidence = float(rule["confidence"])
+    if not math.isfinite(confidence) or confidence < confidence_threshold:
+        return False
+    field = "can_replace" if relation == "replace" else "can_place_on"
+    return bool(rule[field])

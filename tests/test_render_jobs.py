@@ -62,9 +62,25 @@ class RenderJobsTest(unittest.TestCase):
             self.assertEqual(len(first["jobs"]), 1)
             self.assertEqual(first["jobs"], second["jobs"])
             self.assertEqual(first["jobs"][0]["target"]["relation"], "replace")
+            self.assertIn(
+                first["jobs"][0]["target"]["entity_id"],
+                {"scene:entity:table", "scene:entity:table-secondary"},
+            )
             self.assertEqual(first["jobs"][0]["license"]["decision"], "allowed")
             self.assertEqual(first["jobs"][0]["camera"]["strategy"], "generated_target_visible")
             self.assertNotIn("name", first["jobs"][0]["camera"])
+            self.assertEqual(first["jobs"][0]["base_scene_digest"], sha256_file(blend))
+            render_job_digest = first["jobs"][0]["lineage"]["render_job_digest"]
+            self.assertEqual(
+                first["jobs"][0]["job_id"],
+                "composition_" + render_job_digest.removeprefix("sha256:")[:20],
+            )
+
+            config.data["m4"]["render"] = {"samples": 8}
+            changed_contract = build_render_jobs(config)
+            self.assertNotEqual(
+                first["jobs"][0]["job_id"], changed_contract["jobs"][0]["job_id"]
+            )
 
     @staticmethod
     def _object_document() -> dict:
@@ -136,6 +152,22 @@ class RenderJobsTest(unittest.TestCase):
                 "obb_world": {"center": [0.0, 0.0, 2.0], "dimensions": [0.2, 0.2, 0.4]},
                 "override_applied": False,
             },
+            {
+                "entity_id": "scene:entity:table-secondary",
+                "node_ids": ["scene:node:table-secondary"],
+                "raw_label": "table secondary",
+                "category": "table",
+                "category_confidence": 1.0,
+                "grouping_confidence": 1.0,
+                "grouping_method": "test",
+                "replaceable": True,
+                "support_surface": True,
+                "obb_world": {
+                    "center": [2.0, 0.0, 0.5],
+                    "dimensions": [1.0, 1.0, 1.0],
+                },
+                "override_applied": False,
+            },
         ]
         return {
             "schema_version": "1.0",
@@ -176,11 +208,27 @@ class RenderJobsTest(unittest.TestCase):
                 "temperature": 0.0,
                 "thinking": False,
             },
-            "class_rules": [],
+            "class_rules": [
+                {
+                    "object_category": "mug",
+                    "scene_category": "table",
+                    "can_place_on": True,
+                    "can_replace": True,
+                    "confidence": 0.95,
+                    "reason": "test",
+                    "cache_key": "test-rule",
+                }
+            ],
             "targets_by_object_category": {
                 "mug": {
-                    "place_on_entity_ids": ["scene:entity:table"],
-                    "replace_entity_ids": ["scene:entity:table"],
+                    "place_on_entity_ids": [
+                        "scene:entity:table-secondary",
+                        "scene:entity:table",
+                    ],
+                    "replace_entity_ids": [
+                        "scene:entity:table-secondary",
+                        "scene:entity:table",
+                    ],
                 }
             },
             "object_index": {"object-1": "mug"},

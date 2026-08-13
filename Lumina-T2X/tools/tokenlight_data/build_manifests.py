@@ -19,14 +19,39 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     config = load_yaml(parse_args().config)
     output_root = Path(config["paths"]["render_output_root"]).expanduser()
-    metadata_paths = sorted((output_root / "components").glob("*/metadata.json"))
-    if not metadata_paths:
-        raise FileNotFoundError(f"没有找到 metadata.json: {output_root / 'components'}")
-    rows = [json.loads(path.read_text(encoding="utf-8")) for path in metadata_paths]
     split_profile = str(config["data"].get("split_profile", "object-held-out"))
     if split_profile not in {"object-held-out", "scene-held-out"}:
         raise ValueError("data.split_profile must be object-held-out or scene-held-out")
     require_composition = bool(config["data"].get("require_composition_contract", False))
+    ignored_foreign_outputs: list[str] = []
+    if require_composition:
+        jobs_path_value = config["paths"].get("render_jobs_manifest")
+        if not jobs_path_value:
+            raise ValueError("paths.render_jobs_manifest is required for composition data")
+        jobs_path = Path(jobs_path_value).expanduser()
+        jobs = load_jsonl(jobs_path)
+        if not jobs:
+            raise FileNotFoundError(f"render job manifest is empty: {jobs_path}")
+        jobs_by_id = {str(job.get("job_id") or ""): job for job in jobs}
+        if "" in jobs_by_id or len(jobs_by_id) != len(jobs):
+            raise ValueError(f"render job manifest contains missing or duplicate job IDs: {jobs_path}")
+        rows = []
+        for job_id, job in sorted(jobs_by_id.items()):
+            metadata_path = output_root / "components" / job_id / "metadata.json"
+            if not metadata_path.is_file():
+                raise FileNotFoundError(f"render job has no completed metadata: {metadata_path}")
+            row = json.loads(metadata_path.read_text(encoding="utf-8"))
+            _validate_job_metadata(row, job, metadata_path)
+            rows.append(row)
+        completed_ids = {
+            path.parent.name for path in (output_root / "components").glob("*/metadata.json")
+        }
+        ignored_foreign_outputs = sorted(completed_ids - set(jobs_by_id))
+    else:
+        metadata_paths = sorted((output_root / "components").glob("*/metadata.json"))
+        if not metadata_paths:
+            raise FileNotFoundError(f"没有找到 metadata.json: {output_root / 'components'}")
+        rows = [json.loads(path.read_text(encoding="utf-8")) for path in metadata_paths]
     grouped: dict[str, list[dict]] = {}
     for row in rows:
         uid = str(row.get("asset_uid") or Path(row["asset"]).stem)
@@ -66,6 +91,7 @@ def main() -> None:
         "counts": {split: len(values) for split, values in split_rows.items()},
         "groups": {split: len({group_key(row, split_profile) for row in values}) for split, values in split_rows.items()},
         "fixture_sources": fixture_source_counts(rows),
+        "ignored_foreign_completed_outputs": ignored_foreign_outputs,
         "license_policy_versions": sorted(
             {str(row.get("license", {}).get("policy_version")) for row in rows}
         ),
@@ -102,6 +128,35 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def load_jsonl(path: Path) -> list[dict]:
+    rows: list[dict] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"invalid JSONL at {path}:{line_number}: {error}") from error
+            if not isinstance(value, dict):
+                raise ValueError(f"JSONL row must be an object at {path}:{line_number}")
+            rows.append(value)
+    return rows
+
+
+def _validate_job_metadata(row: dict, job: dict, path: Path) -> None:
+    expected_digest = str(job.get("lineage", {}).get("render_job_digest") or "")
+    actual_digest = str(row.get("lineage", {}).get("render_job_digest") or "")
+    if row.get("id") != job.get("job_id"):
+        raise ValueError(f"metadata ID does not match render job: {path}")
+    if row.get("asset_uid") != job.get("object_uid"):
+        raise ValueError(f"metadata asset UID does not match render job: {path}")
+    if row.get("base_scene_id") != job.get("base_scene_id"):
+        raise ValueError(f"metadata base scene does not match render job: {path}")
+    if not expected_digest or actual_digest != expected_digest:
+        raise ValueError(f"metadata render-job lineage does not match current manifest: {path}")
 
 
 def group_key(row: dict, split_profile: str) -> str:

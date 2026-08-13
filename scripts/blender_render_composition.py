@@ -61,26 +61,36 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
     final_directory = output_root / "components" / job["job_id"]
     metadata_path = final_directory / "metadata.json"
     if metadata_path.is_file() and not bool(runtime.get("overwrite", False)):
+        _validate_reusable_metadata(metadata_path, job)
         return metadata_path.relative_to(output_root).as_posix()
     if final_directory.exists():
         if not bool(runtime.get("overwrite", False)):
             raise FileExistsError(f"incomplete output exists and overwrite=false: {final_directory}")
         shutil.rmtree(final_directory)
-    partial = recovery.prepare_render_partial(output_root, job["job_id"])
-
     project_root = Path(runtime["project_root"])
     blend_path = (project_root / job["base_scene_blend"]).resolve()
-    object_path = (Path(runtime["object_root"]) / job["object_asset_path"]).resolve()
+    object_root = Path(runtime["object_root"]).resolve()
+    object_path = (object_root / job["object_asset_path"]).resolve()
+    try:
+        object_path.relative_to(object_root)
+    except ValueError as error:
+        raise ValueError("object_asset_path resolves outside OBJECT_ROOT") from error
     if not blend_path.is_file():
         raise FileNotFoundError(blend_path)
     if not object_path.is_file():
         raise FileNotFoundError(object_path)
+    if _sha256_file(blend_path) != job["base_scene_digest"]:
+        raise ValueError("base scene blend digest changed after render-job generation")
     if _sha256_file(object_path) != job["prepared_geometry"]["asset_digest"]:
         raise ValueError("object asset digest changed after render-job generation")
     if job.get("license", {}).get("decision") != "allowed" and bool(
         runtime.get("render", {}).get("require_verified_license", True)
     ):
         raise ValueError("render job license decision is not allowed")
+    # Do not create a partial directory until all preflight checks pass.  A
+    # preflight error has no render state to recover and must not leave an
+    # unclearable partial without failure.json.
+    partial = recovery.prepare_render_partial(output_root, job["job_id"])
 
     try:
         bpy.ops.wm.open_mainfile(filepath=str(blend_path))
@@ -150,7 +160,7 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
         )
         canonical = {
             "origin": [float(value) for value in camera_target],
-            "asset_size": max(float(value) for value in job["target"]["desired_dimensions"]),
+            "asset_size": float(camera_result["subject_diameter"]),
             "position_axes": "x=right,y=camera-forward,z=up",
             "units": "meter",
         }
@@ -217,6 +227,20 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
                 encoding="utf-8",
             )
         raise
+
+
+def _validate_reusable_metadata(metadata_path: Path, job: dict[str, Any]) -> None:
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot reuse invalid metadata: {metadata_path}") from error
+    expected_digest = str(job.get("lineage", {}).get("render_job_digest") or "")
+    actual_digest = str(metadata.get("lineage", {}).get("render_job_digest") or "")
+    if metadata.get("id") != job.get("job_id") or not expected_digest or actual_digest != expected_digest:
+        raise FileExistsError(
+            "completed output does not match the current render job; use a new output root "
+            f"or explicitly archive this stale job directory first: {metadata_path.parent}"
+        )
 
 
 def _normalize_imported(imported, meshes, geometry: dict[str, Any], target: dict[str, Any]):
@@ -802,6 +826,7 @@ def _render_config(value: dict[str, Any]) -> dict[str, Any]:
         "threads_per_worker": "auto",
         "device": "GPU",
         "compute_device_type": "CUDA",
+        "require_gpu": True,
         "ambient_world_strength": 1.0,
         "minimum_visible_pixels": 256,
         "place_footprint_limit": 1.0,

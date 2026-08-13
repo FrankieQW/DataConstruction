@@ -156,11 +156,10 @@ async def annotate_construction(
             )
         )
 
-    review_rows = _build_annotation_review(
-        rules,
-        unresolved,
-        float(annotation_config.get("confidence_review_threshold", 0.8)),
-    )
+    confidence_threshold = float(annotation_config.get("confidence_review_threshold", 0.8))
+    if not 0.0 <= confidence_threshold <= 1.0:
+        raise ValueError("annotation.confidence_review_threshold must be in [0, 1]")
+    review_rows = _build_annotation_review(rules, unresolved, confidence_threshold)
     dump_jsonl_atomic(review_path, review_rows)
     if unresolved and not partial_allowed:
         raise RuntimeError(
@@ -180,7 +179,7 @@ async def annotate_construction(
             for entity in scene.get("entities", []):
                 scene_category = entity["category"]
                 rule = rule_index.get((object_category, scene_category))
-                if rule is None:
+                if rule is None or rule.confidence < confidence_threshold:
                     continue
                 if rule.can_place_on and bool(entity.get("support_surface")):
                     place_ids.add(entity["entity_id"])

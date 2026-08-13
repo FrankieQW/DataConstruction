@@ -105,6 +105,9 @@ def materialize(args: argparse.Namespace) -> None:
             "vae": required_env("VAE_PATH"),
             "dataset_root": str(dataset_root),
             "render_output_root": str(dataset_root),
+            "render_jobs_manifest": str(
+                resolve_from_repo(repo_root, str(project["paths"]["render_jobs_output"]))
+            ),
             "train_manifest": str(manifests / "train.jsonl"),
             "validation_manifest": str(manifests / "validation.jsonl"),
             "test_manifest": str(manifests / "test.jsonl"),

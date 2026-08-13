@@ -106,6 +106,7 @@ paths:
   vae: /path/to/models/sdxl-vae
   dataset_root: /path/to/outputs/tokenlight_dataset
   render_output_root: /path/to/outputs/tokenlight_dataset
+  render_jobs_manifest: /path/to/outputs/manifests/render_jobs.jsonl
   train_manifest: /path/to/outputs/tokenlight_dataset/manifests/train.jsonl
   validation_manifest: /path/to/outputs/tokenlight_dataset/manifests/validation.jsonl
   test_manifest: /path/to/outputs/tokenlight_dataset/manifests/test.jsonl
@@ -140,7 +141,10 @@ python tools/tokenlight_data/validate_components.py --config lumina_next_t2i/con
 python tools/tokenlight_data/inspect_dataset.py --config lumina_next_t2i/config.yaml
 ```
 
-`build_manifests.py` 按所选 profile 分组切分，并写出带 manifest hash、lineage、许可策略和 fixture 来源计数的 `dataset_release.json`。
+composition 模式下，`build_manifests.py` 只接受 `render_jobs_manifest` 当前列出的完成 job，并核对
+metadata 的 job ID、对象、场景与 `render_job_digest`；输出根中的历史完成目录不会混入当前
+manifest。随后脚本按所选 profile 分组切分，并写出带 manifest hash、lineage、许可策略、
+fixture 来源计数和被忽略历史 job ID 的 `dataset_release.json`。
 
 `validate_components.py` 检查：
 

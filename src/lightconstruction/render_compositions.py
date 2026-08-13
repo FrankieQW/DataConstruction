@@ -16,6 +16,9 @@ def clear_render_partial(config: ProjectConfig, *, job_id: str) -> dict[str, Any
     jobs = load_jsonl(jobs_path)
     if not jobs:
         raise ValueError(f"render job manifest is empty: {jobs_path}")
+    job_ids = [str(job.get("job_id") or "") for job in jobs]
+    if any(not job_id for job_id in job_ids) or len(set(job_ids)) != len(job_ids):
+        raise ValueError(f"render job manifest contains missing or duplicate job_id values: {jobs_path}")
     return clear_failed_render_partial(config.path("tokenlight_output"), jobs, job_id)
 
 
@@ -121,13 +124,23 @@ def render_compositions(
             load_jsonl(output_root / "render_workers" / f"worker_{worker_index:03d}" / "errors.jsonl")
         )
     dump_jsonl_atomic(output_root / "render_errors.jsonl", render_errors)
-    metadata_count = sum(1 for _ in (output_root / "components").glob("*/metadata.json"))
+    expected_metadata = {
+        job_id: output_root / "components" / job_id / "metadata.json" for job_id in job_ids
+    }
+    missing_job_outputs = [job_id for job_id, path in expected_metadata.items() if not path.is_file()]
+    metadata_count = len(jobs) - len(missing_job_outputs)
+    completed_ids = {
+        path.parent.name for path in (output_root / "components").glob("*/metadata.json")
+    }
+    foreign_completed_ids = sorted(completed_ids - set(job_ids))
     summary = {
         "generated_at": utc_now(),
         "jobs": len(jobs),
         "rendered_or_reused": metadata_count,
         "render_errors": len(render_errors),
         "worker_failures": worker_failures,
+        "missing_job_outputs": missing_job_outputs,
+        "foreign_completed_outputs": foreign_completed_ids,
         "allow_partial": bool(allow_partial),
     }
     dump_json_atomic(output_root / "render_summary.json", summary)
@@ -136,5 +149,10 @@ def render_compositions(
     if render_errors and not allow_partial:
         raise RuntimeError(
             f"{len(render_errors)} render job(s) failed; see {output_root / 'render_errors.jsonl'}"
+        )
+    if missing_job_outputs and not allow_partial:
+        raise RuntimeError(
+            f"{len(missing_job_outputs)} render job(s) produced no metadata; "
+            f"see {output_root / 'render_summary.json'}"
         )
     return summary

@@ -138,6 +138,7 @@ m4:
     threads_per_worker: auto
     device: GPU
     compute_device_type: CUDA
+    require_gpu: true
     ambient_world_strength: 1.0
     minimum_visible_pixels: 256
     place_footprint_limit: 1.0

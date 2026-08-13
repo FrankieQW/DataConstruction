@@ -221,7 +221,8 @@ def validate_composition_contract(scene: dict[str, Any]) -> None:
     require_vector(canonical.get("origin"), 3, "canonical.origin")
     if not np.allclose(camera["target"], canonical["origin"], atol=1e-6):
         raise ValueError("camera.target 与 canonical.origin 不一致")
-    if float(canonical.get("asset_size", 0)) <= 0:
+    asset_size = float(canonical.get("asset_size", 0))
+    if not np.isfinite(asset_size) or asset_size <= 0:
         raise ValueError("canonical.asset_size 必须为正数")
     if canonical.get("position_axes") != "x=right,y=camera-forward,z=up":
         raise ValueError("canonical.position_axes 与 TokenLight reader 约定不一致")
@@ -239,6 +240,9 @@ def validate_composition_contract(scene: dict[str, Any]) -> None:
         "object_digest",
         "scene_digest",
         "prepared_geometry_digest",
+        "base_scene_source_digest",
+        "render_contract_digest",
+        "render_job_digest",
         "config_digest",
         "generator_version",
     ):

@@ -11,6 +11,7 @@ paths:
   object_root: /mnt/afs_fangwenqi/data/Objaverse
   hdri_root: /mnt/afs_fangwenqi/data/polyhaven_hdri
   render_output_root: /mnt/afs_fangwenqi/data/tokenlight_1000obj_960_in_scene
+  render_jobs_manifest: /mnt/afs_fangwenqi/DataConstruction/outputs/manifests/render_jobs.jsonl
   output_root: /mnt/afs_fangwenqi/Lumina-T2X/outputs/tokenlight
   resume_checkpoint: null
   inference_checkpoint: null
