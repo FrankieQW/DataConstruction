@@ -54,6 +54,8 @@ object.json + scene.json ── annotate-construction
 - 当同一组合同时允许 place 和 replace 时，按 `m4.relation_priority` 选择；默认优先 replace。
 - place 将对象底面中心对齐到 support entity 顶面中心，并检查对象 XY footprint 不超过支撑面限制。
 - replace 隐藏目标 entity 对应的 mesh，将对象按目标包围盒进行 uniform fit。
+- 非目标场景几何先经过 AABB broad phase，再由 world-space BVH 三角面重叠给出最终碰撞结论；AABB 重叠本身不会拒绝样本。
+- 初始尺寸发生真实碰撞或 place footprint 超限时，renderer 按配置进行有下限的等比缩小；每次缩放后重新贴合 target 底面中心。达到最小比例仍不合格时拒绝 job，不会无限缩小对象。
 - 每个 Blender job 都重新打开只读 base `.blend`，不会把上一个样本的状态带入下一个样本。
 
 ### 自建 composition camera
@@ -130,7 +132,7 @@ outputs/
     render_errors.jsonl
 ```
 
-`metadata.json` 包含 composition transform、相机与 canonical 坐标、fixture 来源、base scene fingerprint、输入 digests、许可证决策和生成器版本。只有通过 validator 的 metadata 才能进入正式 manifest。
+`metadata.json` 包含 composition transform、初始/最终 asset scale、碰撞缩放决策、相机与 canonical 坐标、fixture 来源、base scene fingerprint、输入 digests、许可证决策和生成器版本。只有通过 validator 的 metadata 才能进入正式 manifest。
 
 ## 4. 环境
 
@@ -904,6 +906,11 @@ m4:
     resolution: 256
     samples: 16
     require_gpu: true
+    collision_bvh_epsilon: 0.0
+    collision_shrink_enabled: true
+    collision_shrink_factor: 0.90
+    collision_min_scale_ratio: 0.60
+    collision_max_attempts: 6
 ```
 
 服务器上保留一条真实小 Blender batch 验收路径。复制一份独立环境文件，将其中

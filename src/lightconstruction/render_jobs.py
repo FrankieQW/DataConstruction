@@ -26,7 +26,7 @@ from .schemas import (
 )
 
 
-_RENDER_JOB_CONTRACT_VERSION = "2"
+_RENDER_JOB_CONTRACT_VERSION = "3"
 
 
 def build_render_jobs(

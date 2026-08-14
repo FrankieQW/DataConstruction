@@ -142,7 +142,13 @@ m4:
     ambient_world_strength: 1.0
     minimum_visible_pixels: 256
     place_footprint_limit: 1.0
+    # AABB is broad-phase only; BVH triangle overlap decides real collisions.
     collision_aabb_tolerance: 0.002
+    collision_bvh_epsilon: 0.0
+    collision_shrink_enabled: true
+    collision_shrink_factor: 0.90
+    collision_min_scale_ratio: 0.60
+    collision_max_attempts: 6
     point_lights_per_scene: 16
     point_energy: 500.0
     point_position_ranges:

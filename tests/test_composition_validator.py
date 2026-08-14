@@ -63,6 +63,25 @@ class CompositionValidatorTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "不得声明 scene entity"):
             self.validator.validate_composition_contract(row)
 
+    def test_collision_resolution_must_match_final_scale(self) -> None:
+        mutations = {
+            "remaining_collision": lambda row: row["composition"].update(
+                {"collision_pairs": [["inserted", "obstacle"]]}
+            ),
+            "invalid_ratio": lambda row: row["composition"]["collision_resolution"].update(
+                {"scale_ratio": 1.1}
+            ),
+            "scale_mismatch": lambda row: row["composition"].update(
+                {"asset_scale": [0.7, 0.7, 0.7]}
+            ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                row = valid_metadata()
+                mutate(row)
+                with self.assertRaises(ValueError):
+                    self.validator.validate_composition_contract(row)
+
 
 def valid_metadata() -> dict:
     digest = "sha256:" + "a" * 64
@@ -103,6 +122,17 @@ def valid_metadata() -> dict:
             "target_entity_id": "scene-1:entity:target",
             "object_transform_world": [1.0, 0.0, 0.0, 0.0] * 4,
             "inserted_visible_pixels": 512,
+            "initial_asset_scale": [1.0, 1.0, 1.0],
+            "asset_scale": [0.81, 0.81, 0.81],
+            "collision_pairs": [],
+            "collision_resolution": {
+                "strategy": "uniform_shrink",
+                "scale_ratio": 0.81,
+                "attempts": 3,
+                "initial_collision_count": 1,
+                "initial_collision_pairs_preview": [["inserted", "obstacle"]],
+                "footprint_adjusted": False,
+            },
         },
         "lighting_profile": "default",
         "lineage": {

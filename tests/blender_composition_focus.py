@@ -156,12 +156,111 @@ class BlenderCompositionFocusTest(unittest.TestCase):
             with self.assertRaisesRegex(FileExistsError, "does not match"):
                 self.renderer.render_job(job, runtime, self.helpers, self.recovery)
 
+    def test_bvh_rejects_aabb_false_positive(self) -> None:
+        left = self._cube("SceneLeft", (-2.0, 0.0, 0.5))
+        right = self._cube("SceneRight", (2.0, 0.0, 0.5))
+        bpy.ops.object.select_all(action="DESELECT")
+        left.select_set(True)
+        right.select_set(True)
+        bpy.context.view_layer.objects.active = left
+        bpy.ops.object.join()
+        disconnected_scene_mesh = bpy.context.object
+        disconnected_scene_mesh.name = "DisconnectedSceneMesh"
+        inserted = self._cube("Inserted", (0.0, 0.0, 0.5), size=0.5)
+
+        inserted_minimum, inserted_maximum = self.renderer._world_bounds([inserted])
+        scene_minimum, scene_maximum = self.renderer._world_bounds([disconnected_scene_mesh])
+        self.assertTrue(
+            all(
+                min(inserted_maximum[axis], scene_maximum[axis])
+                > max(inserted_minimum[axis], scene_minimum[axis])
+                for axis in range(3)
+            )
+        )
+        collisions = self.renderer._find_scene_collisions(
+            [inserted],
+            [disconnected_scene_mesh],
+            {"collision_aabb_tolerance": 0.0, "collision_bvh_epsilon": 0.0},
+        )
+        self.assertEqual(collisions, [])
+
+    def test_collision_resolution_uniformly_shrinks_and_reanchors(self) -> None:
+        inserted = self._cube("Inserted", (0.0, 0.0, 0.5))
+        root = self._parent_under_root(inserted)
+        self._cube("Obstacle", (0.6, 0.0, 0.5), size=0.4)
+        target = {
+            "relation": "replace",
+            "bottom_center_world": [0.0, 0.0, 0.0],
+            "dimensions_world": [1.0, 1.0, 1.0],
+        }
+        result = self.renderer._resolve_inserted_placement(
+            root,
+            [inserted],
+            [],
+            target,
+            {
+                "collision_aabb_tolerance": 0.0,
+                "collision_bvh_epsilon": 0.0,
+                "collision_shrink_enabled": True,
+                "collision_shrink_factor": 0.8,
+                "collision_min_scale_ratio": 0.6,
+                "collision_max_attempts": 4,
+            },
+        )
+        self.assertEqual(result["collision_pairs"], [])
+        self.assertEqual(result["collision_resolution"]["strategy"], "uniform_shrink")
+        self.assertAlmostEqual(result["collision_resolution"]["scale_ratio"], 0.8)
+        self.assertEqual(result["collision_resolution"]["attempts"], 2)
+        minimum, maximum = self.renderer._world_bounds([inserted])
+        self.assertAlmostEqual(minimum.z, 0.0, places=6)
+        self.assertAlmostEqual((minimum.x + maximum.x) * 0.5, 0.0, places=6)
+        self.assertAlmostEqual((minimum.y + maximum.y) * 0.5, 0.0, places=6)
+
+    def test_collision_resolution_stops_at_minimum_scale(self) -> None:
+        inserted = self._cube("Inserted", (0.0, 0.0, 0.5))
+        root = self._parent_under_root(inserted)
+        obstacle = self._cube("Obstacle", (0.0, 0.0, 0.5))
+        obstacle.scale = (0.2, 2.0, 2.0)
+        bpy.context.view_layer.update()
+        target = {
+            "relation": "replace",
+            "bottom_center_world": [0.0, 0.0, 0.0],
+            "dimensions_world": [1.0, 1.0, 1.0],
+        }
+        with self.assertRaisesRegex(ValueError, "down to ratio 0.6"):
+            self.renderer._resolve_inserted_placement(
+                root,
+                [inserted],
+                [],
+                target,
+                {
+                    "collision_aabb_tolerance": 0.0,
+                    "collision_bvh_epsilon": 0.0,
+                    "collision_shrink_enabled": True,
+                    "collision_shrink_factor": 0.8,
+                    "collision_min_scale_ratio": 0.6,
+                    "collision_max_attempts": 4,
+                },
+            )
+        self.assertAlmostEqual(root.scale.x, 0.6)
+        self.assertAlmostEqual(root.scale.y, 0.6)
+        self.assertAlmostEqual(root.scale.z, 0.6)
+
     @staticmethod
     def _cube(name: str, location, *, size: float = 1.0):
         bpy.ops.mesh.primitive_cube_add(size=size, location=location)
         cube = bpy.context.object
         cube.name = name
         return cube
+
+    @staticmethod
+    def _parent_under_root(obj):
+        root = bpy.data.objects.new(f"Root_{obj.name}", None)
+        bpy.context.collection.objects.link(root)
+        matrix = obj.matrix_world.copy()
+        obj.parent = root
+        obj.matrix_world = matrix
+        return root
 
     @staticmethod
     def _camera_job() -> dict:

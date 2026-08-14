@@ -16,6 +16,7 @@ from typing import Any
 import bpy
 from bpy_extras.object_utils import world_to_camera_view
 from mathutils import Quaternion, Vector
+from mathutils.bvhtree import BVHTree
 
 
 def main() -> None:
@@ -108,14 +109,18 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
                 hidden_target_names.append(obj.name)
 
         imported, meshes = helpers.import_asset(object_path)
-        root, scale = _normalize_imported(imported, meshes, job["prepared_geometry"], job["target"])
-        if job["target"]["relation"] == "place_on":
-            _validate_place_footprint(meshes, job["target"], runtime.get("render", {}))
-        collision_pairs = _validate_scene_collisions(
+        root, initial_scale = _normalize_imported(
+            imported, meshes, job["prepared_geometry"], job["target"]
+        )
+        placement = _resolve_inserted_placement(
+            root,
             meshes,
             target_objects,
-            runtime.get("render", {}),
+            job["target"],
+            render_config,
         )
+        final_scale = placement["final_scale"]
+        collision_pairs = placement["collision_pairs"]
         camera, camera_target, camera_result = _select_camera(
             job,
             target_objects,
@@ -202,9 +207,11 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
                     for obj in target_objects
                 ],
                 "hidden_target_objects": hidden_target_names,
-                "asset_scale": [float(value) for value in scale],
+                "asset_scale": final_scale,
+                "initial_asset_scale": [float(value) for value in initial_scale],
                 "inserted_visible_pixels": inserted_pixels,
                 "collision_pairs": collision_pairs,
+                "collision_resolution": placement["collision_resolution"],
             },
             "lighting_profile": job["lighting_profile"],
             "base_scene_id": job["base_scene_id"],
@@ -287,41 +294,196 @@ def _normalize_imported(imported, meshes, geometry: dict[str, Any], target: dict
     return root, scale
 
 
-def _validate_place_footprint(meshes, target: dict[str, Any], render: dict[str, Any]) -> None:
+def _place_footprint_status(
+    meshes, target: dict[str, Any], render: dict[str, Any]
+) -> tuple[bool, tuple[float, float], tuple[float, float]]:
     minimum, maximum = _world_bounds(meshes)
     object_xy = (maximum.x - minimum.x, maximum.y - minimum.y)
-    target_xy = target["dimensions_world"][:2]
+    target_xy = tuple(float(value) for value in target["dimensions_world"][:2])
     limit = float(render.get("place_footprint_limit", 1.0))
-    if any(object_xy[index] > float(target_xy[index]) * limit for index in range(2)):
-        raise ValueError(f"placed object footprint {object_xy} exceeds support {target_xy}")
+    fits = all(object_xy[index] <= target_xy[index] * limit for index in range(2))
+    return fits, object_xy, target_xy
 
 
-def _validate_scene_collisions(meshes, target_objects, render: dict[str, Any]) -> list[list[str]]:
-    """Reject broad-phase intersections with scene meshes other than the relation target.
+def _align_bottom_to_target(root, meshes, target: dict[str, Any]) -> None:
+    minimum, maximum = _world_bounds(meshes)
+    bottom_center = Vector(
+        ((minimum.x + maximum.x) * 0.5, (minimum.y + maximum.y) * 0.5, minimum.z)
+    )
+    root.location += Vector(target["bottom_center_world"]) - bottom_center
+    bpy.context.view_layer.update()
 
-    This intentionally records an empty collision-pair list in accepted metadata.  The
-    target is excluded because place_on needs contact and replace hides that geometry.
+
+def _resolve_inserted_placement(
+    root,
+    meshes,
+    target_objects,
+    target: dict[str, Any],
+    render: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep the largest deterministic scale that satisfies placement constraints.
+
+    Every retry is a uniform multiplier of the initially normalized scale.  The
+    object is re-anchored at the target bottom center after scaling so shrinking
+    cannot make it float above or drift across the support surface.
     """
-    tolerance = float(render.get("collision_aabb_tolerance", 0.002))
+    enabled = bool(render.get("collision_shrink_enabled", True))
+    shrink_factor = float(render.get("collision_shrink_factor", 0.9))
+    minimum_ratio = float(render.get("collision_min_scale_ratio", 0.6))
+    maximum_attempts = int(render.get("collision_max_attempts", 6))
+    if not 0.0 < shrink_factor < 1.0:
+        raise ValueError("render.collision_shrink_factor must be in (0, 1)")
+    if not 0.0 < minimum_ratio <= 1.0:
+        raise ValueError("render.collision_min_scale_ratio must be in (0, 1]")
+    if maximum_attempts < 1:
+        raise ValueError("render.collision_max_attempts must be positive")
+
+    ratios = [1.0]
+    if enabled:
+        while len(ratios) < maximum_attempts and ratios[-1] > minimum_ratio:
+            next_ratio = max(minimum_ratio, ratios[-1] * shrink_factor)
+            if math.isclose(next_ratio, ratios[-1], rel_tol=0.0, abs_tol=1e-12):
+                break
+            ratios.append(next_ratio)
+
+    initial_scale = [float(value) for value in root.scale]
+    scene_meshes = _collision_scene_meshes(meshes, target_objects)
+    scene_bvh_cache: dict[Any, BVHTree | None] = {}
+    scene_bounds_cache: dict[Any, tuple[Any, Any]] = {}
+    initial_collision_pairs: list[list[str]] = []
+    last_collision_pairs: list[list[str]] = []
+    last_footprint: tuple[float, float] | None = None
+    target_footprint: tuple[float, float] | None = None
+
+    for attempt, ratio in enumerate(ratios, start=1):
+        root.scale = [value * ratio for value in initial_scale]
+        bpy.context.view_layer.update()
+        _align_bottom_to_target(root, meshes, target)
+
+        footprint_fits = True
+        if target["relation"] == "place_on":
+            footprint_fits, last_footprint, target_footprint = _place_footprint_status(
+                meshes, target, render
+            )
+        last_collision_pairs = _find_scene_collisions(
+            meshes,
+            scene_meshes,
+            render,
+            scene_bvh_cache=scene_bvh_cache,
+            scene_bounds_cache=scene_bounds_cache,
+        )
+        if attempt == 1:
+            initial_collision_pairs = list(last_collision_pairs)
+        if footprint_fits and not last_collision_pairs:
+            final_scale = [float(value) for value in root.scale]
+            return {
+                "final_scale": final_scale,
+                "collision_pairs": [],
+                "collision_resolution": {
+                    "strategy": "none" if attempt == 1 else "uniform_shrink",
+                    "scale_ratio": float(ratio),
+                    "attempts": attempt,
+                    "initial_collision_count": len(initial_collision_pairs),
+                    "initial_collision_pairs_preview": initial_collision_pairs[:5],
+                    "footprint_adjusted": bool(attempt > 1 and target["relation"] == "place_on"),
+                },
+            }
+
+    ratio = ratios[-1]
+    if last_collision_pairs:
+        preview = ", ".join(f"{left}<->{right}" for left, right in last_collision_pairs[:5])
+        raise ValueError(
+            "inserted object intersects non-target scene geometry after "
+            f"{len(ratios)} scale attempt(s) down to ratio {ratio:.6g}: {preview}"
+        )
+    raise ValueError(
+        f"placed object footprint {last_footprint} exceeds support {target_footprint} after "
+        f"{len(ratios)} scale attempt(s) down to ratio {ratio:.6g}"
+    )
+
+
+def _collision_scene_meshes(meshes, target_objects) -> list[Any]:
     inserted = set(meshes)
     excluded = inserted | set(target_objects)
-    scene_meshes = [
-        obj
-        for obj in bpy.data.objects
-        if obj.type == "MESH" and obj not in excluded and not obj.hide_render and not obj.hide_viewport
-    ]
+    return sorted(
+        (
+            obj
+            for obj in bpy.data.objects
+            if obj.type == "MESH"
+            and obj not in excluded
+            and not obj.hide_render
+            and not obj.hide_viewport
+        ),
+        key=lambda obj: obj.name,
+    )
+
+
+def _world_bvh(obj, *, epsilon: float = 0.0) -> BVHTree | None:
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh()
+    try:
+        if not mesh.vertices or not mesh.polygons:
+            return None
+        matrix = evaluated.matrix_world
+        vertices = [matrix @ vertex.co for vertex in mesh.vertices]
+        polygons = [tuple(polygon.vertices) for polygon in mesh.polygons]
+        return BVHTree.FromPolygons(
+            vertices,
+            polygons,
+            all_triangles=False,
+            epsilon=epsilon,
+        )
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def _find_scene_collisions(
+    meshes,
+    scene_meshes,
+    render: dict[str, Any],
+    *,
+    scene_bvh_cache: dict[Any, BVHTree | None] | None = None,
+    scene_bounds_cache: dict[Any, tuple[Any, Any]] | None = None,
+) -> list[list[str]]:
+    """Use AABB only as broad phase and BVH triangle overlap as the verdict."""
+    tolerance = float(render.get("collision_aabb_tolerance", 0.002))
+    epsilon = float(render.get("collision_bvh_epsilon", 0.0))
+    if tolerance < 0.0 or epsilon < 0.0:
+        raise ValueError("collision tolerances must be non-negative")
+    cache = {} if scene_bvh_cache is None else scene_bvh_cache
+    bounds_cache = {} if scene_bounds_cache is None else scene_bounds_cache
     collisions: list[list[str]] = []
-    for inserted_obj in sorted(inserted, key=lambda obj: obj.name):
+    for inserted_obj in sorted(set(meshes), key=lambda obj: obj.name):
         inserted_minimum, inserted_maximum = _world_bounds([inserted_obj])
-        for scene_obj in sorted(scene_meshes, key=lambda obj: obj.name):
-            scene_minimum, scene_maximum = _world_bounds([scene_obj])
+        inserted_bvh = _world_bvh(inserted_obj, epsilon=epsilon)
+        if inserted_bvh is None:
+            continue
+        for scene_obj in scene_meshes:
+            if scene_obj not in bounds_cache:
+                bounds_cache[scene_obj] = _world_bounds([scene_obj])
+            scene_minimum, scene_maximum = bounds_cache[scene_obj]
             overlaps = [
                 min(inserted_maximum[axis], scene_maximum[axis])
                 - max(inserted_minimum[axis], scene_minimum[axis])
                 for axis in range(3)
             ]
-            if all(value > tolerance for value in overlaps):
+            if not all(value > tolerance for value in overlaps):
+                continue
+            if scene_obj not in cache:
+                cache[scene_obj] = _world_bvh(scene_obj, epsilon=epsilon)
+            scene_bvh = cache[scene_obj]
+            if scene_bvh is not None and inserted_bvh.overlap(scene_bvh):
                 collisions.append([inserted_obj.name, scene_obj.name])
+    return collisions
+
+
+def _validate_scene_collisions(meshes, target_objects, render: dict[str, Any]) -> list[list[str]]:
+    collisions = _find_scene_collisions(
+        meshes,
+        _collision_scene_meshes(meshes, target_objects),
+        render,
+    )
     if collisions:
         preview = ", ".join(f"{left}<->{right}" for left, right in collisions[:5])
         raise ValueError(f"inserted object intersects non-target scene geometry: {preview}")
@@ -831,6 +993,11 @@ def _render_config(value: dict[str, Any]) -> dict[str, Any]:
         "minimum_visible_pixels": 256,
         "place_footprint_limit": 1.0,
         "collision_aabb_tolerance": 0.002,
+        "collision_bvh_epsilon": 0.0,
+        "collision_shrink_enabled": True,
+        "collision_shrink_factor": 0.9,
+        "collision_min_scale_ratio": 0.6,
+        "collision_max_attempts": 6,
         "point_lights_per_scene": 16,
         "point_energy": 500.0,
         "point_position_ranges": {

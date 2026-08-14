@@ -234,6 +234,37 @@ def validate_composition_contract(scene: dict[str, Any]) -> None:
     require_vector(composition.get("object_transform_world"), 16, "composition.object_transform_world")
     if int(composition.get("inserted_visible_pixels", 0)) <= 0:
         raise ValueError("composition 插入对象没有可见像素")
+    initial_scale = np.asarray(
+        require_vector(
+            composition.get("initial_asset_scale"), 3, "composition.initial_asset_scale"
+        ),
+        dtype=np.float64,
+    )
+    final_scale = np.asarray(
+        require_vector(composition.get("asset_scale"), 3, "composition.asset_scale"),
+        dtype=np.float64,
+    )
+    if np.any(initial_scale <= 0.0) or np.any(final_scale <= 0.0):
+        raise ValueError("composition asset scale 必须为正数")
+    collision_pairs = composition.get("collision_pairs")
+    if collision_pairs != []:
+        raise ValueError("通过验收的 composition.collision_pairs 必须为空")
+    collision_resolution = composition.get("collision_resolution")
+    if not isinstance(collision_resolution, dict):
+        raise ValueError("composition.collision_resolution 必须是 mapping")
+    strategy = collision_resolution.get("strategy")
+    if strategy not in {"none", "uniform_shrink"}:
+        raise ValueError("composition.collision_resolution.strategy 非法")
+    scale_ratio = float(collision_resolution.get("scale_ratio", float("nan")))
+    attempts = int(collision_resolution.get("attempts", 0))
+    if not np.isfinite(scale_ratio) or not 0.0 < scale_ratio <= 1.0 or attempts < 1:
+        raise ValueError("composition collision scale_ratio/attempts 非法")
+    if strategy == "none" and (attempts != 1 or not np.isclose(scale_ratio, 1.0)):
+        raise ValueError("未缩放的 composition 必须记录 ratio=1 且 attempts=1")
+    if strategy == "uniform_shrink" and not scale_ratio < 1.0:
+        raise ValueError("uniform_shrink 必须记录小于 1 的 scale_ratio")
+    if not np.allclose(final_scale, initial_scale * scale_ratio, rtol=1e-6, atol=1e-8):
+        raise ValueError("composition 最终 asset_scale 与 uniform scale_ratio 不一致")
     lineage = scene["lineage"]
     for key in (
         "annotation_digest",
