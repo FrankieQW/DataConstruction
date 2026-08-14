@@ -95,6 +95,9 @@ def materialize(args: argparse.Namespace) -> None:
     project["m4"]["render"]["resolution"] = int(required_env("RENDER_RESOLUTION"))
     project["m4"]["render"]["samples"] = int(required_env("RENDER_SAMPLES"))
     project["m4"]["render"]["persistent_data"] = env_bool("RENDER_PERSISTENT_DATA")
+    project["m4"]["render"]["hdri_root"] = str(
+        resolve_from_repo(repo_root, required_env("HDRI_ROOT"))
+    )
     dataset_root = resolve_from_repo(repo_root, required_env("DATASET_ROOT"))
     project["paths"]["tokenlight_output"] = str(dataset_root)
 

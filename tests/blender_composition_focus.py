@@ -119,6 +119,32 @@ class BlenderCompositionFocusTest(unittest.TestCase):
         finally:
             self.renderer._render_mask = original_render_mask
 
+    def test_ambient_world_is_controlled_and_hdri_selection_is_deterministic(self) -> None:
+        config = self.renderer._render_config(
+            {"hdri_root": None, "ambient_world_strength": 1.25}
+        )
+        job = {"job_id": "composition_hdri", "seed": 123}
+        background, hdri = self.renderer._configure_ambient_world(config, job)
+        self.assertIsNone(hdri)
+        self.assertAlmostEqual(background.inputs["Strength"].default_value, 1.25)
+        self.assertEqual(
+            tuple(round(value, 2) for value in background.inputs["Color"].default_value),
+            (0.18, 0.18, 0.18, 1.0),
+        )
+        self.assertTrue(background.outputs["Background"].is_linked)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            hdri_root = Path(temporary)
+            first = hdri_root / "first.hdr"
+            second = hdri_root / "nested" / "second.EXR"
+            second.parent.mkdir()
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            selected_once = self.renderer._select_ambient_hdri(hdri_root, job)
+            selected_twice = self.renderer._select_ambient_hdri(hdri_root, job)
+            self.assertEqual(selected_once, selected_twice)
+            self.assertIn(selected_once, {first.resolve(), second.resolve()})
+
     def test_preflight_failure_does_not_create_partial(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

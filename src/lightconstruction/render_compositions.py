@@ -11,6 +11,9 @@ from .io_utils import dump_json_atomic, dump_jsonl_atomic, load_jsonl, utc_now
 from .render_recovery import assert_no_existing_render_partials, clear_failed_render_partial
 
 
+SUPPORTED_HDRI_SUFFIXES = {".hdr", ".exr"}
+
+
 def clear_render_partial(config: ProjectConfig, *, job_id: str) -> dict[str, Any]:
     jobs_path = config.path("render_jobs_output")
     jobs = load_jsonl(jobs_path)
@@ -52,6 +55,7 @@ def render_compositions(
         raise ValueError("m4.render_gpu_ids must be unique non-negative integers")
     worker_count = max(1, int(workers or m4.get("render_workers", len(gpu_ids))))
     worker_count = min(worker_count, len(jobs))
+    render_config = _resolved_render_config(config, m4.get("render", {}))
     runtime_root = output_root / "runtime"
     runtime_root.mkdir(parents=True, exist_ok=True)
     script = config.root / "scripts" / "blender_render_composition.py"
@@ -70,7 +74,7 @@ def render_compositions(
             "worker_index": worker_index,
             "worker_count": worker_count,
             "gpu_id": gpu_id,
-            "render": m4.get("render", {}),
+            "render": render_config,
             "fixture": m4.get("fixture", {}),
             "overwrite": bool(m4.get("overwrite", False)),
             "allow_partial": bool(allow_partial),
@@ -155,6 +159,28 @@ def render_compositions(
             f"see {output_root / 'render_summary.json'}"
         )
     return summary
+
+
+def _resolved_render_config(config: ProjectConfig, value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise TypeError("m4.render must be a mapping")
+    result = dict(value)
+    hdri_value = result.get("hdri_root")
+    if hdri_value in (None, ""):
+        return result
+    hdri_root = Path(os.path.expandvars(str(hdri_value))).expanduser()
+    if not hdri_root.is_absolute():
+        hdri_root = config.root / hdri_root
+    hdri_root = hdri_root.resolve()
+    if not hdri_root.is_dir():
+        raise NotADirectoryError(f"m4.render.hdri_root is not a directory: {hdri_root}")
+    if not any(
+        path.is_file() and path.suffix.lower() in SUPPORTED_HDRI_SUFFIXES
+        for path in hdri_root.rglob("*")
+    ):
+        raise ValueError(f"m4.render.hdri_root contains no .hdr or .exr files: {hdri_root}")
+    result["hdri_root"] = str(hdri_root)
+    return result
 
 
 def _validated_job_ids(jobs: list[dict[str, Any]], jobs_path: Path) -> list[str]:

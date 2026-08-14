@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
 import hashlib
 import importlib.util
 import json
@@ -130,7 +131,7 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
         )
         bpy.context.scene.camera = camera
         _disable_native_lighting()
-        background = _world_background(float(render_config["ambient_world_strength"]))
+        background, ambient_hdri = _configure_ambient_world(render_config, job)
 
         visibility_path = partial / "diagnostics" / "inserted_visibility.png"
         shutil.copyfile(camera_result["mask_path"], visibility_path)
@@ -175,6 +176,14 @@ def render_job(job: dict[str, Any], runtime: dict[str, Any], helpers, recovery) 
             "asset_uid": job["object_uid"],
             "asset": job["object_asset_path"],
             "ambient": _future_relative(ambient_path, partial, final_directory, output_root),
+            "hdri": str(ambient_hdri) if ambient_hdri is not None else None,
+            "ambient_world": {
+                "source": "hdri" if ambient_hdri is not None else "constant_color",
+                "strength": float(render_config["ambient_world_strength"]),
+                "color": None
+                if ambient_hdri is not None
+                else [float(value) for value in render_config["ambient_world_color"]],
+            },
             "dark": _future_relative(dark_path, partial, final_directory, output_root),
             "point_lights": point_components,
             "diffuse": diffuse_components,
@@ -961,21 +970,51 @@ def _disable_native_lighting() -> None:
                 node.inputs["Strength"].default_value = 0.0
 
 
-def _world_background(strength: float):
-    world = bpy.context.scene.world
-    if world is None:
-        world = bpy.data.worlds.new("LC_ControlledWorld")
-        bpy.context.scene.world = world
+def _configure_ambient_world(config: dict[str, Any], job: dict[str, Any]):
+    world = bpy.data.worlds.new("LC_ControlledWorld")
+    bpy.context.scene.world = world
     world.use_nodes = True
-    background = next((node for node in world.node_tree.nodes if node.type == "BACKGROUND"), None)
-    if background is None:
-        world.node_tree.nodes.clear()
-        output = world.node_tree.nodes.new("ShaderNodeOutputWorld")
-        background = world.node_tree.nodes.new("ShaderNodeBackground")
-        world.node_tree.links.new(background.outputs["Background"], output.inputs["Surface"])
-        background.inputs["Color"].default_value = (0.18, 0.18, 0.18, 1.0)
-    background.inputs["Strength"].default_value = strength
-    return background
+    world.node_tree.nodes.clear()
+    output = world.node_tree.nodes.new("ShaderNodeOutputWorld")
+    background = world.node_tree.nodes.new("ShaderNodeBackground")
+    world.node_tree.links.new(background.outputs["Background"], output.inputs["Surface"])
+    hdri = _select_ambient_hdri(config.get("hdri_root"), job)
+    if hdri is not None:
+        environment = world.node_tree.nodes.new("ShaderNodeTexEnvironment")
+        environment.image = bpy.data.images.load(str(hdri), check_existing=True)
+        world.node_tree.links.new(environment.outputs["Color"], background.inputs["Color"])
+        print(f"COMPOSITION_HDRI {job['job_id']}: {hdri}", flush=True)
+    else:
+        background.inputs["Color"].default_value = tuple(
+            float(value) for value in config["ambient_world_color"]
+        )
+    background.inputs["Strength"].default_value = float(config["ambient_world_strength"])
+    return background, hdri
+
+
+def _select_ambient_hdri(root_value: Any, job: dict[str, Any]) -> Path | None:
+    if root_value in (None, ""):
+        return None
+    root = Path(str(root_value)).expanduser().resolve()
+    if not root.is_dir():
+        raise NotADirectoryError(f"HDRI root is not a directory: {root}")
+    candidates = _ambient_hdri_candidates(str(root))
+    if not candidates:
+        raise ValueError(f"HDRI root contains no .hdr or .exr files: {root}")
+    selector = hashlib.sha256(
+        f"{job['seed']}\0{job['job_id']}\0ambient-hdri-v1".encode("utf-8")
+    ).digest()
+    return candidates[int.from_bytes(selector[:8], "big") % len(candidates)]
+
+
+@lru_cache(maxsize=8)
+def _ambient_hdri_candidates(root_value: str) -> tuple[Path, ...]:
+    root = Path(root_value)
+    return tuple(sorted(
+        path.resolve()
+        for path in root.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".hdr", ".exr"}
+    ))
 
 
 def _render_config(value: dict[str, Any]) -> dict[str, Any]:
@@ -989,7 +1028,9 @@ def _render_config(value: dict[str, Any]) -> dict[str, Any]:
         "device": "GPU",
         "compute_device_type": "CUDA",
         "require_gpu": True,
+        "hdri_root": None,
         "ambient_world_strength": 1.0,
+        "ambient_world_color": [0.18, 0.18, 0.18, 1.0],
         "minimum_visible_pixels": 256,
         "place_footprint_limit": 1.0,
         "collision_aabb_tolerance": 0.002,

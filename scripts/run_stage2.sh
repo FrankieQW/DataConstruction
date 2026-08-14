@@ -109,6 +109,8 @@ ensure_vllm() {
 
 run_data() {
   require_dir "${OBJECT_ROOT}"
+  [[ -n "${HDRI_ROOT:-}" ]] || die "HDRI_ROOT is required for composition ambient renders"
+  require_dir "${HDRI_ROOT}"
   require_file "${BLENDER_BIN}"
   materialize_configs
   cd "${REPO_ROOT}"

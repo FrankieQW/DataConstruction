@@ -139,7 +139,11 @@ m4:
     device: GPU
     compute_device_type: CUDA
     require_gpu: true
+    # Stage-2 materialization replaces this with HDRI_ROOT. HDRI files are
+    # selected deterministically per composition from recursive .hdr/.exr files.
+    hdri_root: null
     ambient_world_strength: 1.0
+    ambient_world_color: [0.18, 0.18, 0.18, 1.0]
     minimum_visible_pixels: 256
     place_footprint_limit: 1.0
     # AABB is broad-phase only; BVH triangle overlap decides real collisions.
