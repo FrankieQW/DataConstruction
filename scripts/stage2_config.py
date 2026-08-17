@@ -27,6 +27,9 @@ def parse_args() -> argparse.Namespace:
     materialize.add_argument("--tokenlight-base", required=True)
     materialize.add_argument("--runtime-dir", required=True)
 
+    verify_reuse = subparsers.add_parser("verify-reused-annotation")
+    verify_reuse.add_argument("--project-config", required=True)
+
     smoke = subparsers.add_parser("prepare-smoke")
     smoke.add_argument("--formal-config", required=True)
     smoke.add_argument("--runtime-dir", required=True)
@@ -54,6 +57,9 @@ def main() -> None:
     args = parse_args()
     if args.command == "materialize":
         materialize(args)
+    elif args.command == "verify-reused-annotation":
+        summary = verify_reused_annotation(args.project_config)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
     elif args.command == "prepare-smoke":
         prepare_smoke(args)
     elif args.command == "smoke-resume":
@@ -62,6 +68,99 @@ def main() -> None:
         evaluation(args)
     else:
         verify_smoke(args)
+
+
+def verify_reused_annotation(project_config_path: str | Path) -> dict[str, Any]:
+    """Verify that frozen M1-M3 artifacts can safely be reused by M4."""
+
+    config_path = Path(project_config_path).expanduser().resolve()
+    config = load_yaml(config_path)
+    project = config.get("project")
+    paths = config.get("paths")
+    if not isinstance(project, dict) or not isinstance(paths, dict):
+        raise ValueError("project config must contain project and paths mappings")
+
+    root_value = Path(os.path.expandvars(str(project.get("root", ".")))).expanduser()
+    project_root = (
+        root_value.resolve()
+        if root_value.is_absolute()
+        else (config_path.parent / root_value).resolve()
+    )
+
+    def configured_path(key: str) -> Path:
+        if key not in paths:
+            raise KeyError(f"project config is missing paths.{key}")
+        value = Path(os.path.expandvars(str(paths[key]))).expanduser()
+        return value.resolve() if value.is_absolute() else (project_root / value).resolve()
+
+    object_path = configured_path("object_output")
+    scene_path = configured_path("scene_output")
+    annotation_path = configured_path("annotation_output")
+    documents: dict[str, dict[str, Any]] = {}
+    for label, path in (
+        ("object.json", object_path),
+        ("scene.json", scene_path),
+        ("annotation_construction.json", annotation_path),
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"cannot reuse M1-M3 because {label} does not exist: {path}; "
+                "set REUSE_ANNOTATION=false"
+            )
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError(f"{label} root must be a JSON object: {path}")
+        documents[label] = value
+
+    annotation = documents["annotation_construction.json"]
+    object_digest = f"sha256:{sha256_file(object_path)}"
+    scene_digest = f"sha256:{sha256_file(scene_path)}"
+    if annotation.get("object_digest") != object_digest:
+        raise ValueError(
+            "cannot reuse M1-M3: annotation_construction.json references a stale "
+            f"object.json (annotation={annotation.get('object_digest')!r}, "
+            f"current={object_digest}); set REUSE_ANNOTATION=false"
+        )
+    if annotation.get("scene_digest") != scene_digest:
+        raise ValueError(
+            "cannot reuse M1-M3: annotation_construction.json references a stale "
+            f"scene.json (annotation={annotation.get('scene_digest')!r}, "
+            f"current={scene_digest}); set REUSE_ANNOTATION=false"
+        )
+
+    scenes = documents["scene.json"].get("scenes")
+    if not isinstance(scenes, list) or not scenes:
+        raise ValueError(f"scene.json contains no reusable scenes: {scene_path}")
+    missing_blends: list[str] = []
+    for index, scene in enumerate(scenes):
+        if not isinstance(scene, dict) or not scene.get("normalized_blend"):
+            raise ValueError(f"scene.json scenes[{index}] has no normalized_blend")
+        blend_value = Path(os.path.expandvars(str(scene["normalized_blend"]))).expanduser()
+        blend_path = (
+            blend_value.resolve()
+            if blend_value.is_absolute()
+            else (project_root / blend_value).resolve()
+        )
+        if not blend_path.is_file():
+            missing_blends.append(str(blend_path))
+    if missing_blends:
+        preview = ", ".join(missing_blends[:3])
+        suffix = "" if len(missing_blends) <= 3 else f" (+{len(missing_blends) - 3} more)"
+        raise FileNotFoundError(
+            f"cannot reuse M1-M3: {len(missing_blends)} normalized blend(s) are missing: "
+            f"{preview}{suffix}; set REUSE_ANNOTATION=false"
+        )
+
+    return {
+        "status": "reusable",
+        "project_root": str(project_root),
+        "object": str(object_path),
+        "object_digest": object_digest,
+        "scene": str(scene_path),
+        "scene_digest": scene_digest,
+        "annotation": str(annotation_path),
+        "normalized_blends": len(scenes),
+    }
 
 
 def materialize(args: argparse.Namespace) -> None:

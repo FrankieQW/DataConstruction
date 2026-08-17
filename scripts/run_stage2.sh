@@ -114,24 +114,34 @@ run_data() {
   require_file "${BLENDER_BIN}"
   materialize_configs
   cd "${REPO_ROOT}"
-  log "M1: preparing object inventory"
-  "${PYTHON_BIN}" -m lightconstruction.cli prepare-objects --config "${PROJECT_CONFIG}" --inventory-mode markdown
-
-  log "M2: preparing normalized scene blends"
-  "${PYTHON_BIN}" -m lightconstruction.cli prepare-scenes --config "${PROJECT_CONFIG}" \
-    --blender-bin "${BLENDER_BIN}" --workers 1 --resume
-
   local annotation_path="${REPO_ROOT}/data/annotation_construction.json"
-  if [[ "${REUSE_ANNOTATION,,}" == "true" && -f "${annotation_path}" ]]; then
-    log "M3: reusing ${annotation_path}; stale digests will still be rejected by M4"
-  else
-    ensure_vllm
-    log "M3: building annotation_construction.json"
-    "${PYTHON_BIN}" -m lightconstruction.cli annotate-construction --config "${PROJECT_CONFIG}" \
-      --base-url "${VLLM_BASE_URL}" --model "${VLLM_MODEL}" --concurrency "${VLLM_CONCURRENCY}"
-    cleanup
-    VLLM_PID=""
-  fi
+  case "${REUSE_ANNOTATION,,}" in
+    true)
+      log "M1-M3: verifying and reusing frozen object, scene, and annotation artifacts"
+      "${PYTHON_BIN}" "${SCRIPT_DIR}/stage2_config.py" verify-reused-annotation \
+        --project-config "${PROJECT_CONFIG}"
+      ;;
+    false)
+      log "M1: preparing object inventory"
+      "${PYTHON_BIN}" -m lightconstruction.cli prepare-objects \
+        --config "${PROJECT_CONFIG}" --inventory-mode markdown
+
+      log "M2: preparing normalized scene blends"
+      "${PYTHON_BIN}" -m lightconstruction.cli prepare-scenes --config "${PROJECT_CONFIG}" \
+        --blender-bin "${BLENDER_BIN}" --workers 1 --resume
+
+      ensure_vllm
+      log "M3: building annotation_construction.json"
+      "${PYTHON_BIN}" -m lightconstruction.cli annotate-construction \
+        --config "${PROJECT_CONFIG}" --base-url "${VLLM_BASE_URL}" \
+        --model "${VLLM_MODEL}" --concurrency "${VLLM_CONCURRENCY}"
+      cleanup
+      VLLM_PID=""
+      ;;
+    *)
+      die "REUSE_ANNOTATION must be true or false, got: ${REUSE_ANNOTATION}"
+      ;;
+  esac
 
   log "M4: preparing geometry"
   "${PYTHON_BIN}" -m lightconstruction.cli prepare-geometry --config "${PROJECT_CONFIG}"

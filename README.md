@@ -462,14 +462,14 @@ vim scripts/stage2.env
 
 | 命令 | 执行范围 |
 |---|---|
-| `STAGE2_ENV_FILE=scripts/stage2.data.env bash scripts/run_stage2.sh data` | M1 object、M2 scene、M3 annotation、M4 组合渲染、manifest、组件验证和 Dataset inspection |
+| `STAGE2_ENV_FILE=scripts/stage2.data.env bash scripts/run_stage2.sh data` | `REUSE_ANNOTATION=false` 时运行 M1–M3；为 `true` 时严格复用并验证 M1–M3；随后执行 M4、manifest、组件验证和 Dataset inspection |
 | `STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh tests` | 仅在 `PYTHON_BIN` 指向兼具两边依赖的 `lum-stage2` 克隆时运行全部检查 |
 | `STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh smoke` | 固定小 manifest，单卡执行 forward/backward/update/checkpoint 和精确恢复 |
 | `STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh train` | smoke 与数据摘要仍匹配后，启动单机 8 卡 Stage 2 DDP |
 | `STAGE2_ENV_FILE=scripts/stage2.train.env bash scripts/run_stage2.sh eval` | 使用指定或自动选择的正式 checkpoint 单卡评估 |
 | `bash scripts/run_stage2.sh all` | 仅适用于一个 Python 同时具备 data 与 train 全部依赖的环境；分离环境时禁用 |
 
-已有且 digest 仍有效的 `data/annotation_construction.json` 可通过 `REUSE_ANNOTATION=true` 复用。需要重新标注时，可以先自行启动 vLLM；也可以设置 `START_VLLM=true`，让脚本启动并在标注结束后关闭它。正式渲染不使用 `--allow-partial`，每个 render worker 只启动一次 Blender 并连续消费分配给它的 job；`RENDER_PERSISTENT_DATA=true` 同时启用 Cycles persistent data。
+已有且 digest 仍有效的 `data/object/object.json`、`data/scene/scene.json`、normalized blend 和 `data/annotation_construction.json` 可通过 `REUSE_ANNOTATION=true` 作为一组冻结产物复用；此模式跳过 M1–M3，并在进入 M4 前检查文件、object/scene digest 和全部 normalized blend。任何产物缺失或 stale 都会要求改用 `REUSE_ANNOTATION=false`，不会静默重建其中一部分。需要重建 M1–M3 时，可以先自行启动 vLLM；也可以设置 `START_VLLM=true`，让脚本启动并在标注结束后关闭它。正式渲染不使用 `--allow-partial`，每个 render worker 只启动一次 Blender 并连续消费分配给它的 job；`RENDER_PERSISTENT_DATA=true` 同时启用 Cycles persistent data。
 
 脚本根据模板生成以下运行时文件，不需要手工修改：
 
@@ -515,7 +515,7 @@ annotation/vLLM：
 
 | 变量 | 是否可空 | 作用与约束 |
 |---|---|---|
-| `REUSE_ANNOTATION` | 否 | `true` 时仅在目标文件存在时复用；M4 仍校验 object/scene digest |
+| `REUSE_ANNOTATION` | 否 | `true` 时跳过 M1–M3，并严格验证既有 object/scene/annotation digest 与 normalized blend；`false` 时重建 M1–M3 |
 | `START_VLLM` | 否 | `true` 由脚本启动/关闭服务；`false` 要求 `/v1/models` 已可访问 |
 | `VLLM_BIN` | 否 | 自动启动时使用的 `vllm` 命令，推荐独立环境绝对路径 |
 | `VLLM_MODEL` | 否 | server 与 annotation request 共用的模型名或本地模型目录 |
@@ -623,7 +623,7 @@ smoke 与正式训练：
    STAGE2_ENV_FILE=scripts/stage2.data.env bash scripts/run_stage2.sh data
    ```
 
-   若已有当前 object/scene digest 对应的 annotation，保持 `REUSE_ANNOTATION=true`。如果需要重新调用 Qwen 标注，设置 `REUSE_ANNOTATION=false`，并选择以下一种方式：
+   若已有成组冻结且 digest 对应的 object、scene、normalized blend 和 annotation，保持 `REUSE_ANNOTATION=true`；脚本将跳过 M1–M3，预检通过后直接进入 M4。如果任一文件缺失、digest stale，或者原始 object/scene 已有变化，设置 `REUSE_ANNOTATION=false` 重建 M1–M3，并选择以下一种 vLLM 方式：
 
    ```bash
    # 方式一：先在 scripts/stage2.data.env 中设置 START_VLLM=true，
