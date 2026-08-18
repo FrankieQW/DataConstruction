@@ -38,7 +38,7 @@ class BlenderCompositionFocusTest(unittest.TestCase):
         job = self._camera_job()
         render_config = self.renderer._render_config({"minimum_visible_pixels": 64})
         original_render_mask = self.renderer._render_mask
-        self.renderer._render_mask = lambda path, objects, config: 256
+        self.renderer._render_mask = lambda path, objects, config, **kwargs: 256
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 partial = Path(temporary)
@@ -70,7 +70,7 @@ class BlenderCompositionFocusTest(unittest.TestCase):
         lamp["lc_scene_entity_id"] = "scene-1:entity:lamp"
         render_config = self.renderer._render_config({"minimum_visible_pixels": 64})
         original_render_mask = self.renderer._render_mask
-        self.renderer._render_mask = lambda path, objects, config: 256
+        self.renderer._render_mask = lambda path, objects, config, **kwargs: 256
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 partial = Path(temporary)
@@ -99,8 +99,8 @@ class BlenderCompositionFocusTest(unittest.TestCase):
                         "fallback_candidates": 1,
                         "fallback_position_ranges": {
                             "x": [0.0, 0.0],
-                            "y": [-0.5, -0.5],
-                            "z": [0.0, 0.0],
+                            "y": [0.0, 0.0],
+                            "z": [1.0, 1.0],
                         },
                     }
                 )
@@ -118,6 +118,93 @@ class BlenderCompositionFocusTest(unittest.TestCase):
                 self.assertIsNone(fallback["entity_id"])
         finally:
             self.renderer._render_mask = original_render_mask
+
+    def test_camera_repairs_bad_initial_position_before_rejecting_job(self) -> None:
+        inserted = self._cube("Inserted", (0.0, 0.0, 0.5))
+        job = self._camera_job()
+        job["camera"]["repair_attempts_per_candidate"] = 3
+        render_config = self.renderer._render_config({"minimum_visible_pixels": 64})
+        original_clearance = self.renderer._camera_clearance
+        original_foreground = self.renderer._near_foreground_fraction
+        original_render_mask = self.renderer._render_mask
+        calls = {"clearance": 0}
+
+        def repaired_clearance(*args, **kwargs):
+            calls["clearance"] += 1
+            return 0.0 if calls["clearance"] == 1 else 10.0
+
+        self.renderer._camera_clearance = repaired_clearance
+        self.renderer._near_foreground_fraction = lambda *args, **kwargs: 0.0
+        self.renderer._render_mask = lambda path, objects, config, **kwargs: 256
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                camera, _, result = self.renderer._select_camera(
+                    job, [], [inserted], Path(temporary), render_config
+                )
+                self.assertGreater(result["repair_index"], 0)
+                self.assertGreaterEqual(calls["clearance"], 2)
+                bpy.data.objects.remove(camera, do_unlink=True)
+        finally:
+            self.renderer._camera_clearance = original_clearance
+            self.renderer._near_foreground_fraction = original_foreground
+            self.renderer._render_mask = original_render_mask
+
+    def test_final_camera_rejects_oversized_fixture(self) -> None:
+        inserted = self._cube("Inserted", (0.0, 0.0, 0.5))
+        fixture_mesh = self._cube("Fixture", (0.0, -0.5, 1.0), size=0.1)
+        fixture = {"objects": [fixture_mesh]}
+        job = self._camera_job()
+        render_config = self.renderer._render_config({"minimum_visible_pixels": 64})
+        original_clearance = self.renderer._camera_clearance
+        original_foreground = self.renderer._near_foreground_fraction
+        original_render_mask = self.renderer._render_mask
+        self.renderer._camera_clearance = lambda *args, **kwargs: 10.0
+        self.renderer._near_foreground_fraction = lambda *args, **kwargs: 0.0
+
+        def mask_pixels(path, objects, config, **kwargs):
+            return 10000 if fixture_mesh in objects else 256
+
+        self.renderer._render_mask = mask_pixels
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(ValueError, "no generated camera"):
+                    self.renderer._select_camera(
+                        job,
+                        [],
+                        [inserted],
+                        Path(temporary),
+                        render_config,
+                        fixture=fixture,
+                        fixture_config={
+                            "minimum_visible_pixels": 64,
+                            "maximum_screen_fraction": 0.01,
+                        },
+                    )
+        finally:
+            self.renderer._camera_clearance = original_clearance
+            self.renderer._near_foreground_fraction = original_foreground
+            self.renderer._render_mask = original_render_mask
+
+    def test_reference_mask_exposes_real_occlusion_ratio(self) -> None:
+        inserted = self._cube("Inserted", (0.0, 0.0, 0.5))
+        self._cube("ForegroundBlocker", (1.5, 0.0, 0.5), size=0.75)
+        camera_data = bpy.data.cameras.new("MaskCamera")
+        camera = bpy.data.objects.new("MaskCamera", camera_data)
+        bpy.context.collection.objects.link(camera)
+        camera.location = (3.0, 0.0, 0.5)
+        self.renderer._look_at(camera, (0.0, 0.0, 0.5))
+        bpy.context.scene.camera = camera
+        render_config = self.renderer._render_config({"resolution": 64})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            occluded = self.renderer._render_mask(
+                root / "occluded.png", [inserted], render_config
+            )
+            reference = self.renderer._render_mask(
+                root / "reference.png", [inserted], render_config, occlude=False
+            )
+        self.assertGreater(reference, 0)
+        self.assertLess(occluded, reference)
 
     def test_ambient_world_is_controlled_and_hdri_selection_is_deterministic(self) -> None:
         config = self.renderer._render_config(
@@ -310,6 +397,14 @@ class BlenderCompositionFocusTest(unittest.TestCase):
                 "edge_margin": 0.01,
                 "candidate_count": 1,
                 "target_minimum_visible_pixels": 64,
+                "repair_attempts_per_candidate": 1,
+                "scored_candidate_limit": 1,
+                "minimum_visible_ratio": 0.7,
+                "minimum_clearance": 0.01,
+                "clearance_subject_ratio": 0.01,
+                "foreground_grid_size": 4,
+                "maximum_foreground_fraction": 0.9,
+                "foreground_depth_margin_ratio": 0.1,
             },
         }
 

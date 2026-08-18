@@ -191,8 +191,27 @@ def validate_composition_contract(scene: dict[str, Any]) -> None:
         raise ValueError("composition camera 必须由 generated_target_visible 策略生成")
     if int(camera.get("candidate_index", -1)) < 0:
         raise ValueError("camera.candidate_index 非法")
+    if int(camera.get("coarse_candidate_index", -1)) < 0:
+        raise ValueError("camera.coarse_candidate_index 非法")
+    if int(camera.get("repair_index", -1)) < 0:
+        raise ValueError("camera.repair_index 非法")
     if int(camera.get("target_visible_pixels", 0)) <= 0:
         raise ValueError("composition camera 中没有可见 target entity 区域")
+    reference_pixels = int(camera.get("inserted_reference_pixels", 0))
+    visible_pixels = int(scene.get("composition", {}).get("inserted_visible_pixels", 0))
+    visible_ratio = float(camera.get("inserted_visible_ratio", float("nan")))
+    if reference_pixels <= 0 or visible_pixels <= 0 or visible_pixels > reference_pixels:
+        raise ValueError("composition camera 主体 reference/visible pixels 非法")
+    if not np.isfinite(visible_ratio) or not 0.0 < visible_ratio <= 1.0:
+        raise ValueError("camera.inserted_visible_ratio 非法")
+    if not np.isclose(visible_ratio, visible_pixels / reference_pixels, rtol=1e-5, atol=1e-6):
+        raise ValueError("camera.inserted_visible_ratio 与像素计数不一致")
+    clearance = float(camera.get("clearance", float("nan")))
+    foreground = float(camera.get("near_foreground_fraction", float("nan")))
+    if not np.isfinite(clearance) or clearance < 0.0:
+        raise ValueError("camera.clearance 非法")
+    if not np.isfinite(foreground) or not 0.0 <= foreground <= 1.0:
+        raise ValueError("camera.near_foreground_fraction 非法")
     for key in ("shift_x", "shift_y"):
         if not np.isfinite(float(camera.get(key, float("nan")))):
             raise ValueError(f"camera.{key} 包含 NaN/Inf")
@@ -301,6 +320,9 @@ def validate_fixture_contract(fixture: Any) -> None:
         raise ValueError("procedural_fallback fixture 不得声明 scene entity")
     require_vector(fixture.get("position"), 3, "fixture.position")
     require_vector(fixture.get("renderer_position"), 3, "fixture.renderer_position")
+    screen_fraction = float(fixture.get("screen_fraction", float("nan")))
+    if not np.isfinite(screen_fraction) or not 0.0 < screen_fraction <= 1.0:
+        raise ValueError("fixture.screen_fraction 非法")
 
 
 def require_vector(value: Any, length: int, label: str) -> list[float]:

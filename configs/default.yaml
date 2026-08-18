@@ -122,6 +122,16 @@ m4:
   camera_ndc_y_range: [0.15, 0.85]
   camera_edge_margin: 0.02
   camera_target_minimum_visible_pixels: 64
+  # A coarse orbit candidate is locally repaired before it is rejected.  All
+  # offsets are deterministic, so a render job remains reproducible.
+  camera_repair_attempts_per_candidate: 6
+  camera_scored_candidate_limit: 6
+  camera_minimum_visible_ratio: 0.70
+  camera_minimum_clearance: 0.05
+  camera_clearance_subject_ratio: 0.10
+  camera_foreground_grid_size: 12
+  camera_maximum_foreground_fraction: 0.35
+  camera_foreground_depth_margin_ratio: 0.20
   fixture_categories: [lamp, lantern, light, chandelier, sconce]
   scene_render_overrides: {}
   max_render_jobs: null
@@ -168,13 +178,16 @@ m4:
     require_verified_license: true
   fixture:
     minimum_visible_pixels: 64
+    maximum_screen_fraction: 0.05
     fallback_position_mode: subject_relative
-    fallback_candidates: 12
+    fallback_candidates: 24
     fallback_fixture_size_ratio: 0.12
     fallback_fixture_size_min: 0.01
     fallback_fixture_size_max: 0.08
     # Values are multiplied by the inserted object's maximum world dimension.
+    # Target-relative world-space offsets.  The fixture is fixed before the
+    # final camera search, rather than being regenerated in camera space.
     fallback_position_ranges:
       x: [-1.5, 1.5]
-      y: [-1.0, -0.2]
+      y: [-1.5, 1.5]
       z: [0.8, 2.0]

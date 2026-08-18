@@ -26,7 +26,7 @@ from .schemas import (
 )
 
 
-_RENDER_JOB_CONTRACT_VERSION = "3"
+_RENDER_JOB_CONTRACT_VERSION = "4"
 
 
 def build_render_jobs(
@@ -208,6 +208,14 @@ def build_render_jobs(
                     "ndc_y_range": list(scene_camera.get("ndc_y_range", m4.get("camera_ndc_y_range", [0.15, 0.85]))),
                     "edge_margin": float(scene_camera.get("edge_margin", m4.get("camera_edge_margin", 0.02))),
                     "target_minimum_visible_pixels": int(scene_camera.get("target_minimum_visible_pixels", m4.get("camera_target_minimum_visible_pixels", 64))),
+                    "repair_attempts_per_candidate": int(scene_camera.get("repair_attempts_per_candidate", m4.get("camera_repair_attempts_per_candidate", 6))),
+                    "scored_candidate_limit": int(scene_camera.get("scored_candidate_limit", m4.get("camera_scored_candidate_limit", 6))),
+                    "minimum_visible_ratio": float(scene_camera.get("minimum_visible_ratio", m4.get("camera_minimum_visible_ratio", 0.70))),
+                    "minimum_clearance": float(scene_camera.get("minimum_clearance", m4.get("camera_minimum_clearance", 0.05))),
+                    "clearance_subject_ratio": float(scene_camera.get("clearance_subject_ratio", m4.get("camera_clearance_subject_ratio", 0.10))),
+                    "foreground_grid_size": int(scene_camera.get("foreground_grid_size", m4.get("camera_foreground_grid_size", 12))),
+                    "maximum_foreground_fraction": float(scene_camera.get("maximum_foreground_fraction", m4.get("camera_maximum_foreground_fraction", 0.35))),
+                    "foreground_depth_margin_ratio": float(scene_camera.get("foreground_depth_margin_ratio", m4.get("camera_foreground_depth_margin_ratio", 0.20))),
                 },
                 "lighting_profile": {
                     "name": str(m4.get("lighting_profile", "tokenlight_linear_v1")),
@@ -349,7 +357,15 @@ def _scene_override(config: ProjectConfig, scene_id: str) -> dict[str, Any]:
 
 
 def _validate_camera_contract(camera: dict[str, Any]) -> None:
-    scalar_fields = ("focal_length", "edge_margin")
+    scalar_fields = (
+        "focal_length",
+        "edge_margin",
+        "minimum_visible_ratio",
+        "minimum_clearance",
+        "clearance_subject_ratio",
+        "maximum_foreground_fraction",
+        "foreground_depth_margin_ratio",
+    )
     sequence_fields = (
         "azimuth_degrees",
         "elevation_degrees",
@@ -373,6 +389,20 @@ def _validate_camera_contract(camera: dict[str, Any]) -> None:
         raise ValueError("camera.candidate_count must be positive")
     if int(camera["target_minimum_visible_pixels"]) <= 0:
         raise ValueError("camera.target_minimum_visible_pixels must be positive")
+    if int(camera["repair_attempts_per_candidate"]) <= 0:
+        raise ValueError("camera.repair_attempts_per_candidate must be positive")
+    if int(camera["scored_candidate_limit"]) <= 0:
+        raise ValueError("camera.scored_candidate_limit must be positive")
+    if int(camera["foreground_grid_size"]) < 2:
+        raise ValueError("camera.foreground_grid_size must be at least 2")
+    if not 0.0 < float(camera["minimum_visible_ratio"]) <= 1.0:
+        raise ValueError("camera.minimum_visible_ratio must be in (0, 1]")
+    if float(camera["minimum_clearance"]) < 0.0 or float(camera["clearance_subject_ratio"]) < 0.0:
+        raise ValueError("camera clearance values must be non-negative")
+    if not 0.0 <= float(camera["maximum_foreground_fraction"]) <= 1.0:
+        raise ValueError("camera.maximum_foreground_fraction must be in [0, 1]")
+    if float(camera["foreground_depth_margin_ratio"]) < 0.0:
+        raise ValueError("camera.foreground_depth_margin_ratio must be non-negative")
 
 
 def _rule_allows_target(

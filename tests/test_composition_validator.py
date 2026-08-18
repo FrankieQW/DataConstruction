@@ -48,6 +48,15 @@ class CompositionValidatorTest(unittest.TestCase):
             "fixture_source": lambda row: row["in_scene_lights"][0].update(
                 {"fixture_source": "unknown"}
             ),
+            "visible_ratio": lambda row: row["camera"].update(
+                {"inserted_visible_ratio": 0.1}
+            ),
+            "foreground_fraction": lambda row: row["camera"].update(
+                {"near_foreground_fraction": 1.1}
+            ),
+            "fixture_screen_fraction": lambda row: row["in_scene_lights"][0].update(
+                {"screen_fraction": 0.0}
+            ),
         }
         for label, mutate in mutations.items():
             with self.subTest(label=label):
@@ -96,7 +105,13 @@ def valid_metadata() -> dict:
             "coordinate_space": "blender_world_meter",
             "strategy": "generated_target_visible",
             "candidate_index": 0,
+            "coarse_candidate_index": 0,
+            "repair_index": 1,
             "target_visible_pixels": 256,
+            "inserted_reference_pixels": 640,
+            "inserted_visible_ratio": 0.8,
+            "clearance": 0.25,
+            "near_foreground_fraction": 0.1,
             "shift_x": 0.0,
             "shift_y": 0.0,
             "inserted_ndc_bounds": {
@@ -156,6 +171,7 @@ def valid_metadata() -> dict:
                 "fixture_source": "scene_native",
                 "fixture_entity_id": "scene-1:entity:lamp",
                 "visible_pixels": 128,
+                "screen_fraction": 0.01,
             }
         ],
     }
