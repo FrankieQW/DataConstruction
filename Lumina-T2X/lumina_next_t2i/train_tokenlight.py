@@ -106,6 +106,7 @@ def main() -> None:
             output_device=device.index,
             broadcast_buffers=False,
             gradient_as_bucket_view=True,
+            find_unused_parameters=True,
         )
     model.train()
 

@@ -28,6 +28,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--source", required=True, help="Source RGB image, linear EXR, or NPY")
+    parser.add_argument(
+        "--png-mode",
+        choices=("srgb", "model"),
+        default="srgb",
+        help=(
+            "Interpret PNG/JPEG sources as ordinary sRGB images or as pixels already transformed "
+            "into the training model's [0, 1] image space. EXR/NPY inputs ignore this option."
+        ),
+    )
     parser.add_argument("--output", required=True, help="Output image path")
     parser.add_argument(
         "--task", required=True,
@@ -66,7 +75,12 @@ def main() -> None:
     vae = load_frozen_vae(config, device)
 
     resolution = int(config["data"]["resolution"])
-    source_image = load_source_image(args.source, resolution, config["data"]["exposure"])[None].to(device)
+    source_image = load_source_image(
+        args.source,
+        resolution,
+        config["data"]["exposure"],
+        png_mode=args.png_mode,
+    )[None].to(device)
     fixture_mask = load_fixture_mask(args.fixture_mask, resolution)[None].to(device)
     fixture_present = torch.tensor([args.task == "in_scene_light"], dtype=torch.bool, device=device)
     values = torch.from_numpy(packed.values)[None].to(device)
@@ -94,6 +108,7 @@ def main() -> None:
             "config_sha256": hashlib.sha256(Path(args.config).expanduser().read_bytes()).hexdigest(),
             "checkpoint": report.source,
             "source": str(Path(args.source).expanduser().resolve()),
+            "png_mode": args.png_mode if Path(args.source).suffix.lower() not in {".exr", ".npy"} else None,
             "output": str(Path(args.output).expanduser().resolve()),
             "task": args.task,
             "lighting_token_names": list(schema.names),

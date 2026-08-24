@@ -12,7 +12,12 @@ import torch
 from .tokens import LightingSchema, PackedLighting
 
 
-def load_source_image(path: str | Path, resolution: int, exposure: float) -> torch.Tensor:
+def load_source_image(
+    path: str | Path,
+    resolution: int,
+    exposure: float,
+    png_mode: str = "srgb",
+) -> torch.Tensor:
     path = Path(path).expanduser()
     if not path.is_file():
         raise FileNotFoundError(f"source image 不存在: {path}")
@@ -22,8 +27,23 @@ def load_source_image(path: str | Path, resolution: int, exposure: float) -> tor
         image = image / (1.0 + image)
     else:
         image = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
+        if png_mode == "srgb":
+            image = _srgb_to_linear(image)
+            image = np.maximum(image * float(exposure), 0.0)
+            image = image / (1.0 + image)
+        elif png_mode != "model":
+            raise ValueError(f"unsupported png_mode: {png_mode!r}; expected 'srgb' or 'model'")
     image = _center_resize(image, resolution, is_mask=False)
     return torch.from_numpy(np.ascontiguousarray(image * 2.0 - 1.0)).permute(2, 0, 1)
+
+
+def _srgb_to_linear(image: np.ndarray) -> np.ndarray:
+    """Decode an sRGB display image to relative linear RGB."""
+    return np.where(
+        image <= 0.04045,
+        image / 12.92,
+        ((image + 0.055) / 1.055) ** 2.4,
+    ).astype(np.float32)
 
 
 def load_fixture_mask(path: str | Path | None, resolution: int) -> torch.Tensor:
