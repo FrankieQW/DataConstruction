@@ -17,6 +17,7 @@ def euler_sample(
     fixture_present: torch.Tensor,
     steps: int,
     cfg_scale: float,
+    step_callback: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor:
     if steps < 1:
         raise ValueError("infer.steps 必须大于等于 1")
@@ -40,5 +41,7 @@ def euler_sample(
             )
             velocity = unconditional + float(cfg_scale) * (conditional - unconditional)
         state = state + dt * velocity
+        if step_callback is not None:
+            step_callback(step + 1, state)
     return state
 

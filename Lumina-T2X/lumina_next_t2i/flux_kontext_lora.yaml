@@ -1,0 +1,65 @@
+# Independent FLUX.1-Kontext-dev LoRA configuration. It does not replace config.yaml.
+paths:
+  # Download the complete Diffusers-format model snapshot to this directory.
+  pretrained_model: /mnt/afs_fangwenqi/models/FLUX.1-Kontext-dev
+  tokenlight_config: /mnt/afs_fangwenqi/Lumina-T2X/lumina_next_t2i/config.yaml
+  output_root: /mnt/afs_fangwenqi/Lumina-T2X/outputs/flux_kontext_tokenlight
+  train_manifest: null
+  validation_manifest: null
+  test_manifest: null
+  resume_checkpoint: null
+
+data:
+  resolution: 512
+  samples_per_scene_train: 64
+  samples_per_scene_validation: 8
+  seed: 20260827
+  num_workers: 4
+  tasks: [ambient_scale, global_diffuse, add_light, in_scene_light]
+  task_probabilities:
+    ambient_scale: 0.25
+    global_diffuse: 0.25
+    add_light: 0.25
+    in_scene_light: 0.25
+
+lora:
+  rank: 16
+  alpha: 16
+  dropout: 0.0
+  target_modules:
+    - attn.to_k
+    - attn.to_q
+    - attn.to_v
+    - attn.to_out.0
+    - attn.add_k_proj
+    - attn.add_q_proj
+    - attn.add_v_proj
+    - attn.to_add_out
+    - ff.net.0.proj
+    - ff.net.2
+    - ff_context.net.0.proj
+    - ff_context.net.2
+    - proj_mlp
+
+train:
+  mixed_precision: bf16
+  micro_batch_size: 1
+  gradient_accumulation_steps: 4
+  max_steps: 15000
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  max_grad_norm: 1.0
+  checkpointing_steps: 500
+  checkpoints_total_limit: 5
+  gradient_checkpointing: true
+  # FLUX.1-dev/Kontext is guidance-distilled; this value is also fed during training.
+  guidance_scale: 3.5
+  vae_encode_mode: mode
+  max_sequence_length: 256
+  seed: 42
+  run_name: flux_kontext_tokenlight_lora
+
+infer:
+  steps: 28
+  guidance_scale: 2.5
+  seed: 42

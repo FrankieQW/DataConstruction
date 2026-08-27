@@ -1,0 +1,15 @@
+# Install in a new `flux-kontext` environment, not in the existing `lum` environment.
+torch>=2.6
+torchvision
+diffusers>=0.40.0
+transformers>=4.49
+accelerate>=1.2
+peft>=0.14
+safetensors>=0.4
+sentencepiece
+protobuf
+PyYAML
+numpy<2
+opencv-python-headless
+Pillow
+tensorboard
